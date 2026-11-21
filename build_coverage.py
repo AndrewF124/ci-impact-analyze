@@ -194,7 +194,7 @@ def _run_covered(test_index: int | None, shared_mask: int, function, args, kwarg
     return function(*args, **kwargs)
 
 
-def measure(output: Path) -> None:
+def measure(output: Path, targets=None) -> None:
     for variable in (
         "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS",
         "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS",
@@ -203,7 +203,7 @@ def measure(output: Path) -> None:
 
     import pytest
 
-    coverage = Coverage(capture_startup=True)
+    coverage = Coverage(capture_startup=True, sites={} if targets else None)
 
     class TestContexts:
         def __init__(self):
@@ -211,6 +211,7 @@ def measure(output: Path) -> None:
             self.fixture_masks = {}
             self.passed = set()
             self.failed = set()
+            self.durations = {}
 
         def pytest_collection_finish(self, session):
             self.tests = {item.nodeid: index for index, item in enumerate(session.items)}
@@ -244,6 +245,7 @@ def measure(output: Path) -> None:
                 coverage.switch(None)
 
         def pytest_runtest_logreport(self, report):
+            self.durations[report.nodeid] = self.durations.get(report.nodeid, 0.0) + report.duration
             if report.failed or report.skipped:
                 self.failed.add(report.nodeid)
             elif report.when == "call" and report.passed:
@@ -281,7 +283,7 @@ def measure(output: Path) -> None:
             ProcessPoolExecutor, "submit", submit
         ):
             code = pytest.main(
-                ["-q", "--tb=short", "--continue-on-collection-errors", "tests"],
+                ["-q", "--tb=short", "--continue-on-collection-errors", *(targets or ["tests"])],
                 plugins=[contexts],
             )
 
@@ -301,6 +303,7 @@ def measure(output: Path) -> None:
                 "source_commit": SOURCE_COMMIT,
                 "tests": list(contexts.tests),
                 "unreliable": sorted(unmeasured),
+                "durations": contexts.durations,
                 "startup_lines": {path: sorted(lines) for path, lines in coverage.startup_lines.items()},
                 **coverage.encoded(),
             },
@@ -311,7 +314,7 @@ def measure(output: Path) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        sys.exit("usage: build_coverage.py OUTPUT.json.gz")
+    if len(sys.argv) < 2:
+        sys.exit("usage: build_coverage.py OUTPUT.json.gz [TEST ...]")
     os.environ["SKIP_INTEGRATION"] = "0"
-    measure(Path(sys.argv[1]).resolve())
+    measure(Path(sys.argv[1]).resolve(), sys.argv[2:])

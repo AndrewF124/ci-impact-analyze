@@ -13,7 +13,9 @@ from verify import TPC_TESTS, Verification
 DATA = Path("/data")
 PINNED = Path("/pinned")
 COVERAGE = Path(__file__).with_name("coverage.json.gz")
+ISOLATION = Path(__file__).with_name("isolated.json.gz")
 VERIFICATION = Path(__file__).with_name("verification.json")
+QUERY_PROFILES = Path(__file__).with_name("query-profiles.json.gz")
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
 
@@ -72,16 +74,28 @@ def add_to_slack(workers: list[list[int]], durations: dict[int, int], nearby: fr
 def verify_selected(impact, files, selected, verification, durations, node_ids):
     if not selected:
         return frozenset()
-    # Skip unknown traces and tests too expensive for direct verification.
-    cheap = sorted(n for n in selected - impact.always if durations[n] <= 500)
-    tpc = [n for n in selected - impact.always if node_ids[n] in TPC_TESTS]
+    # Exact cold runs can also establish an outcome for an untraced test.
+    cheap = sorted(n for n in selected if durations[n] <= 500)
+    query_tests = [n for n in selected - impact.always
+                   if node_ids[n] in TPC_TESTS or node_ids[n] in verification.queries]
     probe = len(cheap) <= 12 and 0 < sum(durations[n] for n in cheap) <= 900
-    if not probe and not tpc:
+    if not probe and not query_tests:
         return frozenset()
     edits = impact.patched_files(files)
     passed = set()
-    for n in tpc:
-        if impact.tpc_replay_scope(edits, node_ids[n]) and verification.tpc_passes(edits, node_ids[n]):
+    for n in sorted(query_tests, key=durations.__getitem__, reverse=True):
+        node = node_ids[n]
+        candidates = selected - passed
+        jobs = sorted(((test, durations[test]) for test in candidates), key=itemgetter(1), reverse=True)
+        without = schedule([job for job in jobs if job[0] != n])
+        savings = schedule_cost(schedule(jobs), durations) - schedule_cost(without, durations)
+        if savings <= 0:
+            continue
+        cases = impact.query_cases(edits, node, verification.queries.get(node))
+        if cases is not None and verification.queries_pass(edits, node, cases, savings):
+            passed.add(n)
+        elif (node in TPC_TESTS and savings >= 2_000
+              and impact.tpc_replay_scope(edits, node) and verification.tpc_passes(edits, node)):
             passed.add(n)
     if probe:
         jobs = sorted(((n, durations[n]) for n in selected - passed), key=itemgetter(1), reverse=True)
@@ -90,7 +104,14 @@ def verify_selected(impact, files, selected, verification, durations, node_ids):
         optimistic = schedule_cost(schedule([job for job in jobs if job[0] not in without]), durations)
         # Pay the import/collection cost only when even a clean probe can repay it.
         if current - optimistic > 400 + sum(durations[n] for n in cheap):
-            verified = set(verification.exact_passes(edits, [node_ids[n] for n in cheap], 1.8))
+            ids = [node_ids[n] for n in cheap]
+            cold = [node_ids[n] for n in cheap if n in impact.always]
+            warm = [node_ids[n] for n in cheap if n not in impact.always]
+            try:
+                plan = impact.warm_plan(edits, warm) if warm else None
+            except ValueError:
+                plan = None
+            verified = set(verification.exact_passes(edits, ids, 1.8, plan, cold))
             passed.update(n for n in cheap if node_ids[n] in verified)
     return frozenset(passed)
 
@@ -102,12 +123,12 @@ def schedule_cost(workers, durations):
 def main() -> None:
     tests = json.loads((DATA / "tests.json").read_text(encoding="utf-8"))["tests"]
     try:
-        impact = ImpactIndex(PINNED, COVERAGE, tests)
+        impact = ImpactIndex(PINNED, COVERAGE, tests, ISOLATION)
     except (OSError, ValueError, KeyError, TypeError, EOFError) as error:
         print(f"coverage unavailable: {error}", file=sys.stderr)
         impact = None
     try:
-        verification = Verification(PINNED, json.loads(VERIFICATION.read_bytes()))
+        verification = Verification(PINNED, json.loads(VERIFICATION.read_bytes()), QUERY_PROFILES)
     except (OSError, ValueError):
         verification = None
 
@@ -131,7 +152,7 @@ def main() -> None:
             if verification is not None and files:
                 if selected is None:
                     selected = impact.state_impact(files, verification)
-                elif selected:
+                if selected:
                     verified = verify_selected(impact, files, selected, verification, durations, node_ids)
                     selected -= verified
         except (OSError, ValueError, SyntaxError, RecursionError):
@@ -145,6 +166,8 @@ def main() -> None:
             workers = add_to_slack(workers, durations, impact.nearby(files) - verified)
         print(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
     print(f"selected {selected_count} tests across all patches, {fallback} full-suite fallbacks", file=sys.stderr)
+    if verification is not None:
+        verification.close()
 
 
 if __name__ == "__main__":

@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import ast
 import inspect
+import operator
 from enum import Enum
 from pathlib import Path
 from sys import _getframe
+from types import FunctionType
 
 MISSING = object()
-SWAPS = {ast.Is: ast.Eq, ast.Eq: ast.Is, ast.IsNot: ast.NotEq, ast.NotEq: ast.IsNot}
+SWAPS = {
+    ast.Is: ast.Eq, ast.Eq: ast.Is, ast.IsNot: ast.NotEq, ast.NotEq: ast.IsNot,
+    ast.Lt: ast.LtE, ast.LtE: ast.Lt, ast.Gt: ast.GtE, ast.GtE: ast.Gt,
+}
+ORDER_OPERATORS = {ast.Lt: operator.lt, ast.LtE: operator.le, ast.Gt: operator.gt, ast.GtE: operator.ge}
 SAFE_TYPES = (type(None), bool, int, float, str, bytes)
 TPC_TESTS = {
     "tests/test_executor.py::TestExecutor::test_execute_tpch": "tpc-h",
@@ -90,6 +96,85 @@ def literal_field_edits(original: bytes, patched: bytes, path: str):
     return changes
 
 
+def derived_field_edits(original: bytes, patched: bytes, path: str):
+    """Accept existing flag or dispatch entries with unchanged declaration shape."""
+    changes = {}
+    trees = [ast.parse(contents, type_comments=True) for contents in (original, patched)]
+    left, right = [class_fields(tree, module_name(path)) for tree in trees]
+    for field, a in left.items():
+        name = field.rsplit(":", 1)[1]
+        b = right.get(field)
+        if not isinstance(a, ast.Dict) or not isinstance(b, ast.Dict) or ast.dump(a) == ast.dump(b):
+            continue
+        if name == "arg_types" and path.startswith("sqlglot/expressions/"):
+            compatible = lambda x, y: type(literal(x)) is bool and type(literal(y)) is bool
+        elif name == "SHOW_PARSERS" and path.startswith("sqlglot/parsers/"):
+            compatible = matching_show_factory
+        elif name == "NUMERIC_ESCAPES" and path.startswith("sqlglot/dialects/"):
+            compatible = matching_numeric_escape
+        else:
+            continue
+        if len(a.keys) != len(b.keys):
+            return {}
+        keys = set()
+        for ak, bk, av, bv in zip(a.keys, b.keys, a.values, b.values):
+            akey = ast.dump(ak) if ak is not None else None
+            bkey = ast.dump(bk) if bk is not None else None
+            if akey != bkey:
+                return {}
+            if ast.dump(av) != ast.dump(bv):
+                key = literal(ak)
+                if not isinstance(key, str) or not compatible(av, bv):
+                    return {}
+                keys.add(key)
+        if keys:
+            changes[field] = keys
+    if changes and ast.dump(Shape(left[k] for k in changes).visit(trees[0])) == ast.dump(
+        Shape(right[k] for k in changes).visit(trees[1])
+    ):
+        return changes
+    return {}
+
+
+def matching_show_factory(a, b):
+    if not all(isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+               and call.func.id == "_show_parser" for call in (a, b)):
+        return False
+    if [kw.arg for kw in a.keywords] != [kw.arg for kw in b.keywords] or len(a.args) != len(b.args):
+        return False
+    values = (node for call in (a, b) for node in (*call.args, *(kw.value for kw in call.keywords)))
+    return all(type(literal(node)) in SAFE_TYPES for node in values) and all(
+        kw.arg is not None for call in (a, b) for kw in call.keywords
+    )
+
+
+def matching_numeric_escape(a, b):
+    for node in (a, b):
+        value = literal(node)
+        if type(value) is not tuple or len(value) != 4 or any(type(part) is not int for part in value):
+            return False
+    return True
+
+
+def show_closure(value):
+    """Identify closures returned by the pinned SHOW parser factories."""
+    if (type(value) is not FunctionType or not value.__module__.startswith("sqlglot.parsers.")
+            or not value.__qualname__.startswith("_show_parser.<locals>.")):
+        return None
+    contents = []
+    for cell in value.__closure__ or ():
+        item = cell.cell_contents
+        if type(item) is tuple and all(type(element) in SAFE_TYPES for element in item):
+            contents.append(item)
+        elif type(item) is dict and all(type(k) is str and type(v) in SAFE_TYPES for k, v in item.items()):
+            contents.append(item)
+        elif type(item) in SAFE_TYPES:
+            contents.append(item)
+        else:
+            return None
+    return value.__module__, value.__qualname__, contents
+
+
 def simple_comparisons(tree):
     """Comparisons that start a condition, with operands readable without calls."""
     for node in ast.walk(tree):
@@ -138,17 +223,30 @@ def resolve(node, frame):
     return MISSING
 
 
-def equal_operators(a, b):
-    """Certify agreement only when no user equality implementation can run."""
+def equal_operators(a, b, op=ast.Is):
+    """Compare both operators only on operand types whose behavior is known."""
     if a is MISSING or b is MISSING:
         return False
+    if op in ORDER_OPERATORS:
+        if type(a) not in SAFE_TYPES or type(b) not in SAFE_TYPES:
+            return False
+        try:
+            return ORDER_OPERATORS[op](a, b) == ORDER_OPERATORS[SWAPS[op]](a, b)
+        except TypeError:
+            return False
     if type(a) in SAFE_TYPES and type(b) in SAFE_TYPES:
         return (a is b) == (a == b)
     if a is None or b is None:
         other = b if a is None else a
         return type(other).__eq__ is object.__eq__ and type(other).__ne__ is object.__ne__
-    # Enum members may have custom equality. Exact object operators are safe.
-    return all(isinstance(x, Enum) and type(x).__eq__ is object.__eq__ and type(x).__ne__ is object.__ne__ for x in (a, b))
+    if type(a) is type(b) and isinstance(a, Enum):
+        cls = type(a)
+        if cls.__eq__ is object.__eq__ and cls.__ne__ is object.__ne__:
+            return True
+        for base in (str, int):
+            if cls.__eq__ is base.__eq__ and cls.__ne__ is base.__ne__:
+                return (a is b) == base.__eq__(a, b)
+    return False
 
 
 class SemanticTrace:
@@ -177,9 +275,23 @@ class SemanticTrace:
                 self.memory_sensitive.add(path)
             parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
             for node in ast.walk(tree):
+                if (path == "sqlglot/tokenizer_core.py" and isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute) and node.func.attr == "get"
+                        and isinstance(node.func.value, ast.Attribute) and node.func.value.attr == "numeric_escapes"):
+                    self.sites.setdefault((path, node.lineno), []).append((node, "numeric"))
+                if (path == "sqlglot/parser.py" and isinstance(node, ast.FunctionDef)
+                        and node.name == "_find_parser"):
+                    for statement in ast.walk(node):
+                        if (isinstance(statement, ast.Assign) and isinstance(statement.value, ast.Subscript)
+                                and isinstance(statement.value.value, ast.Name)
+                                and statement.value.value.id == "parsers"):
+                            self.sites.setdefault((path, statement.lineno), []).append((statement, "show"))
                 if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) and node.attr in names:
                     parent = parents.get(node)
                     lookup = None
+                    if (path == "sqlglot/expressions/core.py" and node.attr == "required_args"
+                            and isinstance(parent, ast.For) and parent.iter is node):
+                        self.sites.setdefault((path, node.lineno), []).append((node, "required"))
                     if isinstance(parent, ast.Subscript) and parent.value is node:
                         lookup = parent.slice
                     elif isinstance(parent, ast.Attribute) and parent.attr == "get":
@@ -209,23 +321,33 @@ class SemanticTrace:
         where = (path, line)
         count = self.counts.get(where, 0) + 1
         self.counts[where] = count
-        if count > 1024:
-            # Retain the test for this site when the bounded trace is incomplete.
-            for node, _ in sites:
-                if isinstance(node, ast.Compare):
-                    self.put("comparison_uncertain", f"{path}:{site_key(node)}", mask, startup)
-                else:
-                    self.put("unknown_owner", node.attr, mask, startup)
-            return False
         frame = _getframe(2)
+        active = False
         for node, lookup in sites:
+            if isinstance(lookup, str):
+                self.observe_derived(lookup, frame, mask, startup)
+                active = True
+                continue
             if isinstance(node, ast.Compare):
                 key = f"{path}:{site_key(node)}"
+                uncertain, at_startup = self.masks.get("comparison_uncertain", {}).get(key, (0, False))
+                if (mask and uncertain & mask == mask) or (startup and at_startup):
+                    continue
+                if count > 16_384:
+                    self.put("comparison_uncertain", key, mask, startup)
+                    continue
                 a, b = resolve(node.left, frame), resolve(node.comparators[0], frame)
                 self.put("comparison_seen", key, mask, startup)
-                if not equal_operators(a, b):
+                if not equal_operators(a, b, type(node.ops[0])):
                     self.put("comparison_uncertain", key, mask, startup)
+                else:
+                    active = True
                 continue
+            if count > 1024:
+                if count == 1025:
+                    self.put("unknown_owner", node.attr, mask, startup)
+                continue
+            active = True
             owner = resolve(node.value, frame)
             cls = owner if isinstance(owner, type) else type(owner)
             expected = type.__getattribute__ if isinstance(owner, type) else object.__getattribute__
@@ -244,7 +366,26 @@ class SemanticTrace:
                 self.put("dict_key", f"{key}:{selector}", mask, startup)
             else:
                 self.put("whole_value", key, mask, startup)
-        return True
+        return active
+
+    def observe_derived(self, kind, frame, mask, startup):
+        locals_ = frame.f_locals
+        if kind == "numeric":
+            key = "0" if locals_["is_octal"] else locals_["peek"]
+            self.put(kind, key, mask, startup)
+            return
+        cls = type(locals_["self"])
+        if kind == "required":
+            values = locals_["self"].args
+            for key in cls.arg_types:
+                value = values.get(key)
+                if value is None or (type(value) is list and not value):
+                    self.put("required", f"{field_key(cls, 'required_args')}#{key}", mask, startup)
+        else:
+            defining = next((base for base in cls.__mro__ if "SHOW_PARSERS" in vars(base)), None)
+            if defining and locals_.get("parsers") is vars(defining)["SHOW_PARSERS"]:
+                key = " ".join(locals_["this"])
+                self.put("show", f"{field_key(defining, 'SHOW_PARSERS')}#{key}", mask, startup)
 
     def encoded(self):
         return {kind: {key: [format(bits, "x"), startup] for key, (bits, startup) in rows.items()}

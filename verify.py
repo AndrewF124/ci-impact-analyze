@@ -13,7 +13,9 @@ import tempfile
 import time
 from pathlib import Path
 
-from semantic import TPC_TESTS
+from query_replay import load_profiles, run_cases
+from semantic import TPC_TESTS, show_closure
+from warm_verify import WarmProcess
 
 
 def digest(value):
@@ -54,6 +56,19 @@ def snapshot(modules):
                         record(qualifier, value, module)
                 continue
             signature = config_value(value)
+            if isinstance(obj, type):
+                field = prefix + name + "#"
+                if name == "arg_types" and type(value) is dict:
+                    fields.update((field + k, digest(v)) for k, v in value.items()
+                                  if type(k) is str and type(v) is bool)
+                elif name == "required_args" and type(value) is set:
+                    fields.update((field + k, "required") for k in value if type(k) is str)
+                elif name == "NUMERIC_ESCAPES" and type(value) is dict:
+                    fields.update((field + k, digest(config_value(v))) for k, v in value.items()
+                                  if type(k) is str)
+                elif name == "SHOW_PARSERS" and type(value) is dict:
+                    callbacks = [(key, show_closure(v)) for key, v in value.items() if type(key) is str]
+                    fields.update((field + k, digest(v)) for k, v in callbacks if v is not None)
             if signature is not None:
                 if name in unordered and signature[0] == "tuple":
                     signature = ("tuple-from-set", sorted(signature[1], key=repr))
@@ -142,12 +157,14 @@ def pytest_passes(ids):
 
 
 class Verification:
-    def __init__(self, pinned, baseline):
+    def __init__(self, pinned, baseline, query_path=None):
         self.pinned = pinned
         self.baseline = baseline
         self.started = time.monotonic()
         self.warmed = False
         self.pristine = None
+        self.queries = load_profiles(query_path) if query_path is not None else {}
+        self.warm = WarmProcess(pinned) if query_path is not None else None
 
     def run(self, edits, operation, timeout):
         if not hasattr(os, "fork"):
@@ -197,7 +214,7 @@ class Verification:
             os.waitpid(pid, 0)
         return None
 
-    def changed_state(self, edits):
+    def changed_state(self, edits, *, entries=False):
         operation = lambda: snapshot(self.baseline["modules"])
         if self.pristine is None:
             self.pristine = self.run({}, operation, 2.5)
@@ -207,21 +224,45 @@ class Verification:
         if current is None:
             return None
         old = self.pristine
-        return {key for key in old.keys() | current.keys() if old.get(key) != current.get(key)}
+        return {key for key in old.keys() | current.keys()
+                if (entries or "#" not in key) and old.get(key) != current.get(key)}
 
-    def exact_passes(self, edits, ids, timeout):
+    def exact_passes(self, edits, ids, timeout, plan=None, cold=()):
+        passed = []
+        if plan and self.warm:
+            warm_ids = [node_id for node_id in ids if node_id not in cold]
+            result = self.warm.request(edits, plan, warm_ids, timeout)
+            if result is not None:
+                passed, ids = result, cold
+        if not ids:
+            return passed
         if not self.warmed:
-            # The parent never imports sqlglot. Child interpreters import it from the overlay.
+            # Full-overlay verification imports sqlglot only in its children.
             import pytest  # noqa: F401
 
             self.warmed = True
-        return self.run(edits, lambda: pytest_passes(ids), timeout) or []
+        return passed + (self.run(edits, lambda: pytest_passes(ids), timeout) or [])
+
+    def close(self):
+        if self.warm:
+            self.warm.close()
 
     def tpc_passes(self, edits, node_id):
         expected = self.baseline["tpc"].get(node_id)
         if expected:
             return self.run(edits, lambda: tpc_signatures(TPC_TESTS[node_id]) == expected, 4.5) is True
         return False
+
+    def queries_pass(self, edits, node_id, indices, available_ms):
+        profile = self.queries[node_id]
+        # The build records instrumented CPU, an upper estimate for plain replay.
+        estimate = 900 + sum(profile["times"][index] for index in indices)
+        if estimate * 1.5 > available_ms or estimate > 6_000:
+            return False
+        if not indices:
+            return True
+        timeout = min(8.0, max(2.5, 1.5 * estimate / 1000))
+        return self.run(edits, lambda: bool(run_cases(node_id, profile, indices)), timeout) is True
 
 
 if __name__ == "__main__":

@@ -7,3 +7,6 @@
 !build_coverage.py
 !semantic.py
 !verify.py
+!query_replay.py
+!build_isolation.py
+!warm_verify.py

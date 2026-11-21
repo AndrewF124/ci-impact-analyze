@@ -9,7 +9,7 @@ from functools import cache
 from pathlib import Path
 
 from patch_parser import FilePatch, parse_patch
-from semantic import comparison_edits, literal_field_edits, site_key
+from semantic import comparison_edits, derived_field_edits, literal_field_edits, site_key
 
 SOURCE_COMMIT = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
@@ -102,7 +102,7 @@ def changed_statements(before: ast.AST, after: ast.AST) -> list[tuple[int, int]]
 
 
 class ImpactIndex:
-    def __init__(self, pinned: Path, coverage_path: Path, tests: list[dict]):
+    def __init__(self, pinned: Path, coverage_path: Path, tests: list[dict], isolation_path=None):
         self.pinned = pinned
         with gzip.open(coverage_path, "rt", encoding="utf-8") as stream:
             raw = json.load(stream)
@@ -115,6 +115,19 @@ class ImpactIndex:
         self.shared = raw["shared"]
         self.startup = raw["startup_lines"]
         self.semantic = raw.get("semantic", {})
+        self.isolated = {}
+        if isolation_path is not None:
+            try:
+                with gzip.open(isolation_path, "rt", encoding="utf-8") as stream:
+                    profiles = json.load(stream)
+            except (OSError, ValueError, EOFError):
+                profiles = {}
+            for node_id, paths in profiles.items():
+                bit = test_bits.get(node_id, 0)
+                for path, lines in paths.items():
+                    hits = self.isolated.setdefault(path, {})
+                    for line in lines:
+                        hits[line] = hits.get(line, 0) | bit
         self.always = set()
         self.numbers = {}
         unreliable = set(raw["unreliable"])
@@ -162,7 +175,8 @@ class ImpactIndex:
         after = ast.parse(patched, filename=path, type_comments=True)
         callables = changed_callables(before, after)
         lines = self.line_masks(path)
-        mask = lines.get(0, 0)
+        isolated = self.isolated.get(path, {})
+        mask = lines.get(0, 0) | isolated.get(0, 0)
         startup = self.startup.get(path, ())
         if 0 in startup:
             raise UnknownImpact("source read directly during collection")
@@ -174,20 +188,26 @@ class ImpactIndex:
             hits = 0
             for line in range(start, function.end_lineno + 1):
                 hits |= lines.get(line, 0)
+            isolated_hits = 0
+            # A cold import can bind a definition without running its body.
+            for line in range(function.lineno + 1, function.end_lineno + 1):
+                isolated_hits |= isolated.get(line, 0)
             if not hits:
                 raise UnknownImpact("uncovered function")
             spans = changed_statements(function, replacement)
             statement_hits = 0
+            isolated_statements = 0
             for first, last in spans:
                 span_hits = 0
                 for line in range(first, last + 1):
                     span_hits |= lines.get(line, 0)
+                    isolated_statements |= isolated.get(line, 0)
                 if not span_hits:
                     # An absent span does not establish that it was reachable.
                     statement_hits = 0
                     break
                 statement_hits |= span_hits
-            function_mask = statement_hits or hits
+            function_mask = (statement_hits | isolated_statements) if statement_hits else (hits | isolated_hits)
             if statement_hits and len(callables) == 1:
                 function_mask &= ~self.equivalent_comparison(original, patched, path)
             mask |= function_mask
@@ -208,6 +228,9 @@ class ImpactIndex:
         if not self.semantic.get("field"):
             return None
         edits = self.patched_files(files)
+        derived = self.derived_impact(edits, verification)
+        if derived is not None:
+            return derived
         changes = {}
         mask = 0
         for path, patched in edits.items():
@@ -241,6 +264,65 @@ class ImpactIndex:
         mask |= incomplete
         return self.test_numbers(mask) | self.always
 
+    def derived_impact(self, edits, verification):
+        changes = {}
+        mask = 0
+        for path, patched in edits.items():
+            original, _ = self.original(path)
+            allowed = derived_field_edits(original.encode("utf-8"), patched, path)
+            if not allowed or 0 in self.startup.get(path, ()):
+                return None
+            changes.update(allowed)
+            mask |= self.line_masks(path).get(0, 0)
+        names = {field.rsplit(":", 1)[1] for field in changes}
+        if names == {"arg_types"}:
+            kind = "required"
+            affected_names = {"arg_types", "required_args"}
+            observed_field, source = "required_args", "sqlglot/expressions/core.py"
+        elif names == {"SHOW_PARSERS"}:
+            kind = "show"
+            affected_names = names
+            observed_field, source = "SHOW_PARSERS", "sqlglot/parser.py"
+        elif names == {"NUMERIC_ESCAPES"}:
+            kind = "numeric"
+            affected_names = names
+            observed_field, source = "NUMERIC_ESCAPES", "sqlglot/tokenizer_core.py"
+        else:
+            return None
+        if not self.semantic.get(kind):
+            return None
+        state = verification.changed_state(edits, entries=True)
+        expected = {f"{field}#{key}" for field, keys in changes.items() for key in keys}
+        if state is None or not expected <= state:
+            return None
+        allowed_keys = set().union(*changes.values())
+        for change in state:
+            field, separator, key = change.partition("#")
+            name = field.rsplit(":", 1)[1]
+            if name not in affected_names or (separator and key not in allowed_keys):
+                return None
+            if separator and name == observed_field:
+                readers, startup = self.observations(kind, key if kind == "numeric" else change)
+                if startup:
+                    return None
+                mask |= readers
+        uncertain, startup_uncertain = self.observations("derived_uncertain", kind)
+        incomplete, startup_incomplete = self.observations("incomplete", "*")
+        if startup_uncertain or startup_incomplete:
+            return None
+        # Memory-sensitive tests retain their normal coverage if they can reach
+        # the validator or dispatch point that was unavailable to semantic tracing.
+        functions = {
+            "required": {"error_messages"},
+            "show": {"_find_parser"},
+            "numeric": {"_read_byte_escape", "_scan_numeric_escape"},
+        }
+        _, tree = self.original(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in functions[kind]:
+                mask |= incomplete & self.line_masks(source).get(node.lineno, 0)
+        return self.test_numbers(mask | uncertain) | self.always
+
     def tpc_replay_scope(self, edits: dict[str, bytes], node_id: str) -> bool:
         bit = self.test_bits.get(node_id, 0)
         if not bit or not self.semantic.get("tpc_inside"):
@@ -255,6 +337,52 @@ class ImpactIndex:
             if not changes or not all(changed_statements(a, b) for a, b in changes):
                 return False
         return True
+
+    def query_cases(self, edits, node_id, profile):
+        """Map supported body edits to isolated cases, refusing setup changes."""
+        bit = self.test_bits.get(node_id, 0)
+        if not bit or not profile:
+            return None
+        cases = 0
+        for path, patched in edits.items():
+            if self.line_masks(path).get(0, 0) & bit:
+                return None
+            _, original = self.original(path)
+            functions = changed_callables(original, ast.parse(patched, type_comments=True))
+            lines = profile["lines"].get(path, {})
+            for before, after in functions:
+                spans = changed_statements(before, after)
+                if not spans or any(before.lineno <= line <= before.end_lineno for line in self.startup.get(path, ())):
+                    return None
+                for first, last in spans:
+                    for line in range(first, last + 1):
+                        covered = int(lines.get(str(line), "0"), 16)
+                        if not covered and self.isolated.get(path, {}).get(line, 0) & bit:
+                            return None
+                        cases |= covered
+        if cases & 1:
+            return None
+        return [i for i in range(len(profile["times"])) if cases & (2 << i)]
+
+    def warm_plan(self, edits, node_ids):
+        """Restrict in-memory replacement to plain, post-import function bodies."""
+        test_mask = 0
+        for node_id in node_ids:
+            test_mask |= self.test_bits.get(node_id, 0)
+        plan = {}
+        for path, patched in edits.items():
+            if self.line_masks(path).get(0, 0) & test_mask or 0 in self.startup.get(path, ()):
+                return None
+            _, before = self.original(path)
+            locations = []
+            for old, new in changed_callables(before, ast.parse(patched, type_comments=True)):
+                if (not isinstance(old, FUNCTIONS) or old.decorator_list
+                        or any(old.lineno <= line <= old.end_lineno for line in self.startup.get(path, ()))):
+                    return None
+                locations.append((old.name, old.lineno, new.lineno))
+            if locations:
+                plan[path] = locations
+        return plan or None
 
     def file_impact(self, file: FilePatch) -> int:
         path = file.old_path
