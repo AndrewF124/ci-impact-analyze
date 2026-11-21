@@ -12,17 +12,20 @@ import json
 import os
 import sys
 import tempfile
+import tracemalloc
 from concurrent.futures import ProcessPoolExecutor
 from functools import cache
 from multiprocessing.util import Finalize
 from pathlib import Path
 from unittest.mock import patch
 
+from semantic import SemanticTrace, TPC_TESTS
+
 SOURCE_COMMIT = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 
 
 class Coverage:
-    def __init__(self, *, capture_startup=False):
+    def __init__(self, *, capture_startup=False, sites=None):
         self.prefix = os.path.normcase(os.getcwd() + os.sep)
         self.lines: dict[str, dict[int, int]] = {}
         self.shared: dict[str, dict[int, int]] = {}
@@ -32,6 +35,9 @@ class Coverage:
         self.current = None
         self.mask = 0
         self.shared_mask = 0
+        self.semantic = SemanticTrace(sites)
+        self.tpc_mask = 0
+        self.line_only_mask = 0
 
     @cache
     def source_path(self, filename: str) -> str | None:
@@ -60,12 +66,41 @@ class Coverage:
                 )
             if code.co_name != "<module>":
                 self.record(path, code.co_firstlineno)
+            tpc = (self.mask | self.shared_mask) & self.tpc_mask
+            if tpc and path.startswith("sqlglot/optimizer/"):
+                frame = sys._getframe(1)
+                replayed = False
+                while frame is not None:
+                    caller = frame.f_back
+                    if (
+                        frame.f_code.co_name == "optimize"
+                        and self.source_path(frame.f_code.co_filename) == "sqlglot/optimizer/optimizer.py"
+                        and caller is not None
+                        and caller.f_code.co_name == "execute"
+                        and self.source_path(caller.f_code.co_filename) == "sqlglot/executor/__init__.py"
+                    ):
+                        replayed = True
+                        break
+                    frame = caller
+                self.semantic.put("tpc_inside" if replayed else "tpc_outside", path, tpc, False)
+                return None
         return sys.monitoring.DISABLE
 
     def line(self, code, line):
         # A definition's line runs when it is bound at import time. Only an
         # actual code entry or file read is a startup dependency for body edits.
-        self.record(self.source_path(code.co_filename), line, startup=False)
+        path = self.source_path(code.co_filename)
+        self.record(path, line, startup=False)
+        mask = self.mask | self.shared_mask
+        if mask & self.line_only_mask:
+            return sys.monitoring.DISABLE
+        sites = self.semantic.sites.get((path, line))
+        if sites and (self.mask or self.capture_startup):
+            if tracemalloc.is_tracing():
+                # Avoid retaining profiling allocations in tests that measure memory growth.
+                self.semantic.put("incomplete", "*", mask, self.capture_startup)
+            elif self.semantic.observe(sites, path, line, mask, self.capture_startup):
+                return None
         return sys.monitoring.DISABLE
 
     def audit(self, event, args):
@@ -108,6 +143,8 @@ class Coverage:
         self.shared_mask = shared_mask
         if self.mask:
             self.capture_startup = False
+            if (self.mask | self.shared_mask) & self.line_only_mask:
+                self.semantic.put("incomplete", "*", self.mask | self.shared_mask, False)
             sys.monitoring.restart_events()
 
     def encoded(self) -> dict:
@@ -117,10 +154,11 @@ class Coverage:
                 for path, hits in table.items()
             }
 
-        return {"lines": encode(self.lines), "shared": encode(self.shared)}
+        return {"lines": encode(self.lines), "shared": encode(self.shared), "semantic": self.semantic.encoded()}
 
     def merge(self, result: dict) -> None:
         self.incomplete |= int(result["incomplete"], 16)
+        self.semantic.merge(result["semantic"])
         for table, encoded in ((self.lines, result["lines"]), (self.shared, result["shared"])):
             for path, incoming in encoded.items():
                 hits = table.setdefault(path, {})
@@ -138,9 +176,12 @@ def _save_worker(directory: Path, coverage: Coverage) -> None:
         json.dump({**coverage.encoded(), "incomplete": format(coverage.incomplete, "x")}, stream)
 
 
-def _start_worker(directory: Path, test_index: int | None, shared_mask: int, initializer, initargs) -> None:
+def _start_worker(directory: Path, test_index: int | None, shared_mask: int, sites, tpc_mask, line_only_mask,
+                  initializer, initargs) -> None:
     global _worker_coverage
-    _worker_coverage = Coverage()
+    _worker_coverage = Coverage(sites=sites)
+    _worker_coverage.tpc_mask = tpc_mask
+    _worker_coverage.line_only_mask = line_only_mask
     _worker_coverage.begin()
     Finalize(None, _save_worker, args=(directory, _worker_coverage), exitpriority=10)
     _worker_coverage.switch(test_index, shared_mask)
@@ -173,6 +214,11 @@ def measure(output: Path) -> None:
 
         def pytest_collection_finish(self, session):
             self.tests = {item.nodeid: index for index, item in enumerate(session.items)}
+            coverage.tpc_mask = sum(1 << self.tests[node] for node in TPC_TESTS if node in self.tests)
+            coverage.line_only_mask = sum(
+                1 << index for node, index in self.tests.items()
+                if node.partition("::")[0] in coverage.semantic.memory_sensitive
+            )
             for index, item in enumerate(session.items):
                 for scope in item.listchain():
                     if scope is not item:
@@ -220,7 +266,8 @@ def measure(output: Path) -> None:
                 max_workers=min(max_workers, 3),
                 mp_context=mp_context,
                 initializer=_start_worker,
-                initargs=(directory, coverage.current, coverage.shared_mask, initializer, initargs),
+                initargs=(directory, coverage.current, coverage.shared_mask, coverage.semantic.sites,
+                          coverage.tpc_mask, coverage.line_only_mask, initializer, initargs),
                 **kwargs,
             )
 

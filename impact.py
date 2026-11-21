@@ -9,6 +9,7 @@ from functools import cache
 from pathlib import Path
 
 from patch_parser import FilePatch, parse_patch
+from semantic import comparison_edits, literal_field_edits, site_key
 
 SOURCE_COMMIT = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
@@ -109,9 +110,11 @@ class ImpactIndex:
             raise UnknownImpact("coverage does not match pinned sqlglot")
 
         test_bits = {node_id: 1 << index for index, node_id in enumerate(raw["tests"])}
+        self.test_bits = test_bits
         self.lines = raw["lines"]
         self.shared = raw["shared"]
         self.startup = raw["startup_lines"]
+        self.semantic = raw.get("semantic", {})
         self.always = set()
         self.numbers = {}
         unreliable = set(raw["unreliable"])
@@ -134,6 +137,23 @@ class ImpactIndex:
     def original(self, path: str) -> tuple[str, ast.AST]:
         contents = (self.pinned / path).read_bytes()
         return contents.decode("utf-8"), ast.parse(contents, filename=path, type_comments=True)
+
+    def observations(self, kind: str, key: str) -> tuple[int, bool]:
+        bits, startup = self.semantic.get(kind, {}).get(key, ("0", False))
+        return int(bits, 16), startup
+
+    def equivalent_comparison(self, original: str, patched: bytes, path: str) -> int:
+        if not self.semantic.get("comparison_seen"):
+            return 0
+        site = comparison_edits(original.encode("utf-8"), patched)
+        if site is None:
+            return 0
+        key = f"{path}:{site_key(site)}"
+        seen, startup = self.observations("comparison_seen", key)
+        uncertain, _ = self.observations("comparison_uncertain", key)
+        incomplete, _ = self.observations("incomplete", "*")
+        uncertain |= incomplete
+        return 0 if startup else seen & ~uncertain
 
     def python_impact(self, file: FilePatch, path: str) -> int:
         original, before = self.original(path)
@@ -167,8 +187,74 @@ class ImpactIndex:
                     statement_hits = 0
                     break
                 statement_hits |= span_hits
-            mask |= statement_hits or hits
+            function_mask = statement_hits or hits
+            if statement_hits and len(callables) == 1:
+                function_mask &= ~self.equivalent_comparison(original, patched, path)
+            mask |= function_mask
         return mask
+
+    def patched_files(self, files: list[FilePatch]) -> dict[str, bytes]:
+        edits = {}
+        for file in files:
+            path = file.old_path
+            if path != file.new_path or not path or not path.startswith("sqlglot/") or not path.endswith(".py"):
+                raise UnknownImpact("verification requires existing Python source")
+            original, _ = self.original(path)
+            edits[path] = file.apply(original).encode("utf-8")
+        return edits
+
+    def state_impact(self, files, verification):
+        """Use measured consumers for restricted edits with a checked import result."""
+        if not self.semantic.get("field"):
+            return None
+        edits = self.patched_files(files)
+        changes = {}
+        mask = 0
+        for path, patched in edits.items():
+            original, _ = self.original(path)
+            changed = literal_field_edits(original.encode("utf-8"), patched, path)
+            if not changed or 0 in self.startup.get(path, ()):
+                return None
+            changes.update(changed)
+            mask |= self.line_masks(path).get(0, 0)
+
+        # Plain declarations can still feed another binding during class creation.
+        # Compare a fresh import and require evidence for each state change.
+        state_changes = verification.changed_state(edits)
+        if state_changes is None or not changes.keys() <= state_changes:
+            return None
+        for field in state_changes:
+            readers, startup = self.observations("field", field)
+            unresolved, unresolved_startup = self.observations("unknown_owner", field.rsplit(":", 1)[1])
+            if not readers or unresolved_startup or (startup and field not in changes):
+                return None
+            keys = changes.get(field)
+            if keys and not startup:
+                readers, _ = self.observations("whole_value", field)
+                for key in keys:
+                    bits, _ = self.observations("dict_key", f"{field}:{key}")
+                    readers |= bits
+            mask |= readers | unresolved
+        incomplete, startup_incomplete = self.observations("incomplete", "*")
+        if startup_incomplete:
+            return None
+        mask |= incomplete
+        return self.test_numbers(mask) | self.always
+
+    def tpc_replay_scope(self, edits: dict[str, bytes], node_id: str) -> bool:
+        bit = self.test_bits.get(node_id, 0)
+        if not bit or not self.semantic.get("tpc_inside"):
+            return False
+        for path, patched in edits.items():
+            inside, _ = self.observations("tpc_inside", path)
+            outside, _ = self.observations("tpc_outside", path)
+            if not inside & bit or outside & bit or self.line_masks(path).get(0, 0) & bit:
+                return False
+            _, original = self.original(path)
+            changes = changed_callables(original, ast.parse(patched, type_comments=True))
+            if not changes or not all(changed_statements(a, b) for a, b in changes):
+                return False
+        return True
 
     def file_impact(self, file: FilePatch) -> int:
         path = file.old_path
@@ -187,13 +273,33 @@ class ImpactIndex:
     def select(self, patch_text: str) -> frozenset[int] | None:
         """Return selected test numbers, or None when the full suite is needed."""
         try:
-            mask = 0
-            for file in parse_patch(patch_text):
-                mask |= self.file_impact(file)
+            return self.select_files(parse_patch(patch_text))
         except (ValueError, OSError, SyntaxError, RecursionError):
             return None
 
-        selected = set(self.always)
+    def select_files(self, files: list[FilePatch]) -> frozenset[int] | None:
+        try:
+            mask = 0
+            for file in files:
+                mask |= self.file_impact(file)
+        except (ValueError, OSError, SyntaxError, RecursionError):
+            return None
+        return self.test_numbers(mask) | self.always
+
+    def nearby(self, files: list[FilePatch]) -> frozenset[int]:
+        """Return tests that reach the old source around otherwise scoped edits."""
+        mask = 0
+        for file in files:
+            if file.old_path is None:
+                continue
+            lines = self.line_masks(file.old_path)
+            for hunk in file.hunks:
+                for line in range(max(1, hunk.old_offset - 8), hunk.old_offset + hunk.old_count + 9):
+                    mask |= lines.get(line, 0)
+        return self.test_numbers(mask)
+
+    def test_numbers(self, mask: int) -> frozenset[int]:
+        selected = set()
         while mask:
             bit = mask & -mask
             if bit in self.numbers:

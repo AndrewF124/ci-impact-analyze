@@ -5,3 +5,5 @@
 !patch_parser.py
 !impact.py
 !build_coverage.py
+!semantic.py
+!verify.py

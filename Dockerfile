@@ -12,14 +12,20 @@ COPY requirements.lock /tmp/requirements.lock
 RUN python -m pip install --no-cache-dir --requirement /tmp/requirements.lock
 
 FROM coverage-deps AS coverage
-COPY build_coverage.py /build_coverage.py
+COPY build_coverage.py semantic.py /
 WORKDIR /pinned
 ENV PYTHONPATH=/pinned PYTHONDONTWRITEBYTECODE=1
 RUN python /build_coverage.py /coverage.json.gz
 
-FROM base
-COPY selector.py patch_parser.py impact.py /app/
-COPY --from=pinned /pinned/sqlglot /pinned/sqlglot
+FROM coverage-deps AS fingerprints
+COPY semantic.py verify.py /
+WORKDIR /pinned
+ENV PYTHONPATH=/pinned PYTHONDONTWRITEBYTECODE=1 SKIP_INTEGRATION=0 OPENBLAS_NUM_THREADS=1
+RUN python /verify.py /verification.json
+
+FROM coverage-deps
+COPY selector.py patch_parser.py impact.py semantic.py verify.py /app/
 COPY --from=coverage /coverage.json.gz /app/coverage.json.gz
-ENV PYTHONDONTWRITEBYTECODE=1
+COPY --from=fingerprints /verification.json /app/verification.json
+ENV PYTHONDONTWRITEBYTECODE=1 SKIP_INTEGRATION=0 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 PYTHON_CPU_COUNT=2
 CMD ["python", "/app/selector.py"]
