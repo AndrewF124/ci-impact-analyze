@@ -12,7 +12,7 @@ COPY requirements.lock /tmp/requirements.lock
 RUN python -m pip install --no-cache-dir --requirement /tmp/requirements.lock
 
 FROM coverage-deps AS coverage
-COPY build_coverage.py semantic.py /
+COPY build_coverage.py semantic.py fixture_impact.py bytecode_coverage.py /
 WORKDIR /pinned
 ENV PYTHONPATH=/pinned PYTHONDONTWRITEBYTECODE=1
 RUN python /build_coverage.py /coverage.json.gz
@@ -24,6 +24,10 @@ RUN python /build_isolation.py /coverage.json.gz /isolated.json.gz
 FROM coverage AS subprocess-profiles
 COPY build_subprocess_profiles.py /
 RUN python /build_subprocess_profiles.py /coverage.json.gz /subprocess.json
+
+FROM coverage AS replay-costs
+COPY replay_costs.py warm_verify.py /
+RUN python /replay_costs.py /coverage.json.gz /replay-costs.json
 
 FROM coverage-deps AS fingerprints
 COPY semantic.py verify.py query_replay.py warm_verify.py optimizer_replay.py /
@@ -43,19 +47,28 @@ WORKDIR /pinned
 ENV PYTHONPATH=/pinned PYTHONDONTWRITEBYTECODE=1 SKIP_INTEGRATION=0 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
 RUN python /optimizer_replay.py /optimizer-checkpoints.json.gz
 
+FROM coverage-deps AS parser-profile
+COPY parser_replay.py query_replay.py semantic.py impact.py patch_parser.py fixture_impact.py bytecode_coverage.py /
+WORKDIR /pinned
+ENV PYTHONPATH=/pinned PYTHONDONTWRITEBYTECODE=1 SKIP_INTEGRATION=0 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
+RUN python /parser_replay.py /parser-profile.json.gz
+
 FROM pinned AS structural-references
 COPY semantic.py fallback.py /
 WORKDIR /pinned
 RUN python /fallback.py /structural-references.json
 
 FROM coverage-deps
-COPY selector.py patch_parser.py impact.py fallback.py semantic.py verify.py query_replay.py warm_verify.py optimizer_replay.py /app/
+COPY selector.py patch_parser.py impact.py fallback.py semantic.py verify.py query_replay.py warm_verify.py optimizer_replay.py fixture_impact.py parser_replay.py /app/
+COPY replay_costs.py case_replay.py bytecode_coverage.py /app/
 COPY --from=coverage /coverage.json.gz /app/coverage.json.gz
 COPY --from=isolation /isolated.json.gz /app/isolated.json.gz
 COPY --from=subprocess-profiles /subprocess.json /app/subprocess.json
 COPY --from=fingerprints /verification.json /app/verification.json
 COPY --from=queries /query-profiles.json.gz /app/query-profiles.json.gz
 COPY --from=checkpoints /optimizer-checkpoints.json.gz /app/optimizer-checkpoints.json.gz
+COPY --from=parser-profile /parser-profile.json.gz /app/parser-profile.json.gz
+COPY --from=replay-costs /replay-costs.json /app/replay-costs.json
 COPY --from=structural-references /structural-references.json /app/structural-references.json
 # Compile immutable runtime code during the build. Pinned source uses checked
 # hashes so patched overlays cannot run pristine bytecode for a changed file.

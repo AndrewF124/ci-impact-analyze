@@ -310,7 +310,7 @@ def replay(profile, indices, budget_ms):
     estimate = 1_200 + sum(profile["cases"][str(index)][4] for index in remaining)
     if (time.process_time() - start) * 1000 + estimate > budget_ms:
         return False
-    return bool(run_executor_cases("tpc-ds", indices=remaining))
+    return bool(run_executor_cases("tpc-ds", indices=remaining, target_dataset_only=True))
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ import time
 from functools import cache
 from pathlib import Path
 from concurrent.futures import Future
+from contextlib import nullcontext
 from unittest.mock import patch
 
 from semantic import TPC_TESTS
@@ -64,13 +65,18 @@ class QueryTrace:
         self.monitor.free_tool_id(self.tool)
 
 
-def run_executor_cases(dataset, indices=None, trace=None, before_case=None):
+def run_executor_cases(dataset, indices=None, trace=None, before_case=None, *, target_dataset_only=False):
     """Use the suite's setup, exact worker functions and result assertions."""
     from sqlglot import parse_one
     from tests import test_executor as suite
 
     tpch = dataset == "tpc-h"
-    suite.TestExecutor.setUpClass()
+    other_schema = "TPCDS_SCHEMA" if tpch else "TPCH_SCHEMA"
+    # Optimizer-only checkpoints never consult the other dataset. Use the pinned
+    # setup for the relevant rows, fixture SQL and DuckDB views.
+    context = patch.object(suite, other_schema, {}) if target_dataset_only else nullcontext()
+    with context:
+        suite.TestExecutor.setUpClass()
     try:
         instance = suite.TestExecutor()
         cases = instance.tpch_sqls if tpch else instance.tpcds_sqls

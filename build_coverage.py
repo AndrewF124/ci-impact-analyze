@@ -15,10 +15,13 @@ import tempfile
 import tracemalloc
 from concurrent.futures import ProcessPoolExecutor
 from functools import cache
+from inspect import CO_OPTIMIZED
 from multiprocessing.util import Finalize
 from pathlib import Path
 from unittest.mock import patch
 
+from bytecode_coverage import BlockTrace
+from fixture_impact import fixture_open_key
 from semantic import SemanticTrace, TPC_TESTS
 
 SOURCE_COMMIT = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
@@ -26,7 +29,7 @@ DIALECT_REGISTRY = {"_Dialect.get", "_Dialect.__getitem__", "_Dialect._try_load"
 
 
 class Coverage:
-    def __init__(self, *, capture_startup=False, sites=None):
+    def __init__(self, *, capture_startup=False, sites=None, track_initializers=False, isolated=False, blocks=False):
         self.prefix = os.path.normcase(os.getcwd() + os.sep)
         self.lines: dict[str, dict[int, int]] = {}
         self.shared: dict[str, dict[int, int]] = {}
@@ -39,6 +42,10 @@ class Coverage:
         self.semantic = SemanticTrace(sites)
         self.tpc_mask = 0
         self.line_only_mask = 0
+        self.initializers = {} if track_initializers else None
+        self.startup_initializers = {}
+        self.noninitializers = {} if isolated else None
+        self.blocks = BlockTrace(self) if blocks else None
 
     @cache
     def source_path(self, filename: str) -> str | None:
@@ -49,7 +56,7 @@ class Coverage:
             return filename[len(self.prefix):].replace(os.sep, "/")
         return None
 
-    def record(self, path: str, line: int, *, startup: bool = True) -> None:
+    def record(self, path: str, line: int, *, startup: bool = True, initializer: bool = False) -> None:
         if self.mask:
             hits = self.lines.setdefault(path, {})
             hits[line] = hits.get(line, 0) | self.mask
@@ -58,6 +65,21 @@ class Coverage:
             hits[line] = hits.get(line, 0) | self.shared_mask
         if self.capture_startup and startup:
             self.startup_lines.setdefault(path, set()).add(line)
+        if initializer:
+            if self.capture_startup:
+                self.startup_initializers.setdefault(path, set()).add(line)
+            elif self.mask:
+                # Use the test actually making the import, not all consumers of a shared fixture.
+                hits = self.initializers.setdefault(path, {})
+                hits[line] = hits.get(line, 0) | self.mask
+        elif self.noninitializers is not None:
+            self.noninitializers.setdefault(path, set()).add(line)
+
+    def is_initializer(self, code):
+        # At module scope both module and class bodies use a namespace mapping. A
+        # class constructed inside a function belongs to that function's execution.
+        return (self.initializers is not None and not code.co_flags & CO_OPTIMIZED
+                and "<locals>" not in code.co_qualname)
 
     def start(self, code, _offset):
         if (
@@ -75,7 +97,9 @@ class Coverage:
                     sys.monitoring.COVERAGE_ID, code, sys.monitoring.events.LINE
                 )
             if code.co_name != "<module>":
-                self.record(path, code.co_firstlineno)
+                self.record(path, code.co_firstlineno, initializer=self.is_initializer(code))
+            if self.blocks is not None:
+                self.blocks.start(path, code)
             if path == "sqlglot/dialects/dialect.py" and code.co_qualname in DIALECT_REGISTRY:
                 if code.co_name == "classes":
                     self.record("dialect:registry", 0)
@@ -109,7 +133,7 @@ class Coverage:
         # A definition's line runs when it is bound at import time. Only an
         # actual code entry or file read is a startup dependency for body edits.
         path = self.source_path(code.co_filename)
-        self.record(path, line, startup=False)
+        self.record(path, line, startup=False, initializer=self.is_initializer(code))
         mask = self.mask | self.shared_mask
         if mask & self.line_only_mask:
             return sys.monitoring.DISABLE
@@ -177,6 +201,9 @@ class Coverage:
                                 return
                             frame = frame.f_back
                     self.record(path, 0)
+                    key = fixture_open_key(path, self.source_path(caller.co_filename), caller.co_name)
+                    if key is not None:
+                        self.record(key, 0)
 
     def begin(self) -> None:
         monitor = sys.monitoring
@@ -184,6 +211,8 @@ class Coverage:
         monitor.use_tool_id(tool, "blast-radius coverage")
         monitor.register_callback(tool, monitor.events.PY_START, self.start)
         monitor.register_callback(tool, monitor.events.LINE, self.line)
+        if self.blocks is not None:
+            self.blocks.begin(monitor)
         monitor.set_events(tool, monitor.events.PY_START)
         sys.addaudithook(self.audit)
 
@@ -197,6 +226,8 @@ class Coverage:
             self.capture_startup = False
             if (self.mask | self.shared_mask) & self.line_only_mask:
                 self.semantic.put("incomplete", "*", self.mask | self.shared_mask, False)
+                if self.blocks is not None:
+                    self.blocks.suspend()
             sys.monitoring.restart_events()
 
     def encoded(self) -> dict:
@@ -206,9 +237,24 @@ class Coverage:
                 for path, hits in table.items()
             }
 
-        return {
+        result = {
             "lines": encode(self.lines), "shared": encode(self.shared), "semantic": self.semantic.encoded(),
             "integer_guards": self.semantic.encoded_integer_ranges(),
+        }
+        if self.blocks is not None:
+            result["bytecode_blocks"] = self.blocks.encoded()
+        return result
+
+    def initialization_profile(self):
+        # Worker traces supplement line coverage but cannot attest when a module
+        # was first loaded in the pytest process.
+        return {
+            "initializers": {
+                path: {line: format(mask, "x") for line, mask in hits.items()}
+                for path, hits in self.initializers.items()
+            },
+            "startup_initializers": {path: sorted(lines) for path, lines in self.startup_initializers.items()},
+            "noninitializers": {path: sorted(lines) for path, lines in (self.noninitializers or {}).items()},
         }
 
     def merge(self, result: dict) -> None:
@@ -259,7 +305,8 @@ def measure(output: Path, targets=None) -> None:
 
     import pytest
 
-    coverage = Coverage(capture_startup=True, sites={} if targets else None)
+    coverage = Coverage(capture_startup=True, sites={} if targets else None,
+                        track_initializers=True, isolated=bool(targets), blocks=not targets)
 
     class TestContexts:
         def __init__(self):
@@ -268,6 +315,9 @@ def measure(output: Path, targets=None) -> None:
             self.passed = set()
             self.failed = set()
             self.durations = {}
+            self.executed = []
+            self.completed_phases = {}
+            self.worker_tests = 0
 
         def pytest_collection_finish(self, session):
             self.tests = {item.nodeid: index for index, item in enumerate(session.items)}
@@ -294,6 +344,7 @@ def measure(output: Path, targets=None) -> None:
 
         @pytest.hookimpl(wrapper=True)
         def pytest_runtest_protocol(self, item, nextitem):
+            self.executed.append(item.nodeid)
             coverage.switch(self.tests[item.nodeid])
             try:
                 return (yield)
@@ -304,8 +355,10 @@ def measure(output: Path, targets=None) -> None:
             self.durations[report.nodeid] = self.durations.get(report.nodeid, 0.0) + report.duration
             if report.failed or report.skipped:
                 self.failed.add(report.nodeid)
-            elif report.when == "call" and report.passed:
-                self.passed.add(report.nodeid)
+            elif report.passed:
+                self.completed_phases.setdefault(report.nodeid, set()).add(report.when)
+                if report.when == "call":
+                    self.passed.add(report.nodeid)
 
     contexts = TestContexts()
     original_init = ProcessPoolExecutor.__init__
@@ -319,6 +372,7 @@ def measure(output: Path, targets=None) -> None:
             # to keep memory and CPU use predictable on the build host.
             if max_workers is None:
                 max_workers = os.process_cpu_count() or 1
+            contexts.worker_tests |= coverage.mask | coverage.shared_mask
             original_init(
                 pool,
                 max_workers=min(max_workers, 3),
@@ -330,6 +384,7 @@ def measure(output: Path, targets=None) -> None:
             )
 
         def submit(pool, function, /, *args, **kwargs):
+            contexts.worker_tests |= coverage.mask | coverage.shared_mask
             return original_submit(
                 pool, _run_covered, coverage.current, coverage.shared_mask, function, args, kwargs
             )
@@ -353,6 +408,13 @@ def measure(output: Path, targets=None) -> None:
     unmeasured.update(
         test for test, index in contexts.tests.items() if coverage.incomplete & (1 << index)
     )
+    ordered_tests = []
+    if not targets and code == 0 and contexts.executed == list(contexts.tests):
+        ordered_tests = [
+            test for test, index in contexts.tests.items()
+            if test not in unmeasured and not contexts.worker_tests & (1 << index)
+            and {"setup", "call", "teardown"} <= contexts.completed_phases.get(test, set())
+        ]
     with gzip.open(output, "wt", encoding="utf-8", compresslevel=4) as stream:
         json.dump(
             {
@@ -363,7 +425,10 @@ def measure(output: Path, targets=None) -> None:
                 "fixture_directories": True,
                 "module_discovery": True,
                 "startup_lines": {path: sorted(lines) for path, lines in coverage.startup_lines.items()},
+                "ordered_tests": ordered_tests,
+                "worker_tests": [test for test, index in contexts.tests.items() if contexts.worker_tests & (1 << index)],
                 **coverage.encoded(),
+                **coverage.initialization_profile(),
             },
             stream,
             separators=(",", ":"),

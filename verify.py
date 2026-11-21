@@ -14,8 +14,8 @@ import time
 from pathlib import Path
 
 from optimizer_replay import SOURCE as OPTIMIZER_SOURCE, cases_for, changed_site, replay as replay_optimizer
-from query_replay import load_profiles, run_cases
-from semantic import module_name, show_closure
+from query_replay import load_profiles, run_cases, run_executor_cases
+from semantic import TPC_TESTS, module_name, show_closure
 from warm_verify import WarmProcess
 
 
@@ -171,16 +171,25 @@ def pytest_collection():
 
 
 class Verification:
-    def __init__(self, pinned, baseline, query_path=None, checkpoint_path=None):
+    def __init__(self, pinned, baseline, query_path=None, checkpoint_path=None, *, fast=False, parser_path=None):
         self.pinned = pinned
         self.baseline = baseline
         self.started = time.monotonic()
         self.warmed = False
         self.pristine = None
-        self.queries = load_profiles(query_path) if query_path is not None else {}
-        self.warm = WarmProcess(pinned) if query_path is not None else None
+        self.query_path = query_path
+        self._queries = None
+        self.warm = WarmProcess(pinned) if fast or query_path is not None else None
         self.checkpoint_path = checkpoint_path
         self.checkpoints = None
+        self.parser_path = parser_path
+        self.parser_profile = None
+
+    @property
+    def queries(self):
+        if self._queries is None:
+            self._queries = load_profiles(self.query_path) if self.query_path is not None else {}
+        return self._queries
 
     def run(self, edits, operation, timeout):
         if not hasattr(os, "fork"):
@@ -241,7 +250,13 @@ class Verification:
         unchanged = unordered.copy()
         for path in edits:
             unchanged.pop(module_name(path), None)
-        current = self.run(edits, lambda: snapshot(modules, unchanged), 2.5)
+        current = None
+        if self.warm and len(edits) == 1 and time.monotonic() - self.started < 55:
+            prefix = {key: value for key, value in self.pristine.items() if key.startswith("sqlglot:")}
+            if prefix:
+                current = self.warm.request_state(edits, modules, unchanged, prefix, 2.5)
+        if current is None:
+            current = self.run(edits, lambda: snapshot(modules, unchanged), 2.5)
         if current is None:
             return None
         old = self.pristine
@@ -280,6 +295,36 @@ class Verification:
             self.warmed = True
         return passed + (self.run(edits, lambda: pytest_passes(ids), timeout) or [])
 
+    def warm_passes(self, edits, plan, ids, timeout):
+        if self.warm is None or not ids:
+            return False
+        passed = self.warm.request(edits, plan, ids, timeout, fast=True)
+        return passed is not None and set(passed) == set(ids)
+
+    def parser_passes(self, edits, savings):
+        if self.parser_path is None or savings < 3_000:
+            return False
+        from parser_replay import eligible, run_cheap
+
+        if self.parser_profile is None:
+            self.parser_profile = load_profiles(self.parser_path)
+        if not eligible(self.parser_profile, self.pinned, edits):
+            return False
+        timeout = min(2.0, savings / 2_000)
+        return self.run(edits, lambda: run_cheap(self.parser_profile), timeout) is True
+
+    def fixture_cases_pass(self, edits, node_id, replay, savings):
+        from case_replay import run_verified
+
+        timings = self.queries[node_id]["times"]
+        if len(timings) != replay.case_count:
+            return False
+        estimate = 700 + sum(timings[index] for index in replay.indices)
+        if estimate * 1.5 >= savings or estimate > 4_000:
+            return False
+        timeout = min(5.0, savings / 1_500, max(1.0, 2 * estimate / 1_000))
+        return self.run(edits, lambda: run_verified(node_id, replay), timeout) is True
+
     def close(self):
         if self.warm:
             self.warm.close()
@@ -308,7 +353,7 @@ class Verification:
         timeout = min(18.0, 2.0 + 1.4 * budget / 1000)
         return self.run(edits, lambda: replay_optimizer(profile, cases, budget), timeout) is True
 
-    def queries_pass(self, edits, node_id, indices, available_ms):
+    def queries_pass(self, edits, node_id, indices, available_ms, *, optimizer_only=False):
         if not indices:
             return False
         profile = self.queries[node_id]
@@ -317,7 +362,11 @@ class Verification:
         if estimate * 1.5 > available_ms or estimate > 6_000:
             return False
         timeout = min(8.0, max(2.5, 1.5 * estimate / 1000))
-        return self.run(edits, lambda: bool(run_cases(node_id, profile, indices)), timeout) is True
+        if optimizer_only:
+            operation = lambda: bool(run_executor_cases(TPC_TESTS[node_id], indices, target_dataset_only=True))
+        else:
+            operation = lambda: bool(run_cases(node_id, profile, indices))
+        return self.run(edits, operation, timeout) is True
 
 
 if __name__ == "__main__":

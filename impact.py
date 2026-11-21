@@ -10,6 +10,8 @@ from functools import cache
 from pathlib import Path
 from types import CodeType
 
+from bytecode_coverage import unchanged_blocks
+from fixture_impact import unaffected_fixture_readers
 from patch_parser import FilePatch, parse_patch
 from semantic import (
     MISSING, Shape, comparison_edits, derived_field_edits, integer_guard_edit, literal,
@@ -190,10 +192,13 @@ class ImpactIndex:
         self.startup = raw["startup_lines"]
         self.semantic = raw.get("semantic", {})
         self.integer_guards = raw.get("integer_guards", {})
-        self.integer_guard_unreliable = sum(test_bits.get(node_id, 0) for node_id in set(raw["unreliable"]))
+        self.unreliable_mask = sum(test_bits.get(node_id, 0) for node_id in set(raw["unreliable"]))
+        self.bytecode_blocks = raw.get("bytecode_blocks", {})
+        self.worker_mask = sum(test_bits.get(node_id, 0) for node_id in set(raw.get("worker_tests", ())))
         self.fixture_directories = raw.get("fixture_directories", False)
         self.module_discovery = raw.get("module_discovery", False)
         self.isolated = {}
+        profiles = {}
         if isolation_path is not None:
             try:
                 with gzip.open(isolation_path, "rt", encoding="utf-8") as stream:
@@ -221,6 +226,7 @@ class ImpactIndex:
                 hits = self.isolated.setdefault(path, {})
                 for line in lines:
                     hits[line] = hits.get(line, 0) | bit
+        self.isolated_mask = sum(test_bits.get(node_id, 0) for node_id in profiles.keys() | child_profiles.keys())
         self.always = set()
         self.numbers = {}
         unreliable = set(raw["unreliable"]) - child_profiles.keys()
@@ -280,7 +286,7 @@ class ImpactIndex:
             seen |= mask
             if first < stop and low < stop and first <= high:
                 unknown |= mask
-        return seen & ~(unknown | incomplete | self.integer_guard_unreliable)
+        return seen & ~(unknown | incomplete | self.unreliable_mask)
 
     def python_impact(self, file: FilePatch, path: str, *, compare_operands=True) -> int:
         original, before = self.original(path)
@@ -331,18 +337,28 @@ class ImpactIndex:
                 function_mask &= ~self.equivalent_comparison(before, after, path)
                 # The range proof was measured in suite order, not in separate cold runs.
                 function_mask &= ~(self.equivalent_integer_guard(before, after, path) & ~isolated_statements)
+                if profile := self.bytecode_blocks.get(path):
+                    proved = unchanged_blocks(profile, self.compiled(path), compiled, function, replacement)
+                    incomplete, _ = self.observations("incomplete", "*")
+                    unproved = self.unreliable_mask | self.worker_mask | incomplete | isolated_hits
+                    function_mask &= ~(proved & ~unproved)
             mask |= function_mask
         return mask
 
-    def patched_files(self, files: list[FilePatch]) -> dict[str, bytes]:
+    def patched_files(self, files: list[FilePatch], *, fixtures=False) -> dict[str, bytes]:
         edits = {}
         for file in files:
             path = file.old_path
-            if path != file.new_path or not path or not path.startswith("sqlglot/") or not path.endswith(".py"):
-                raise UnknownImpact("verification requires existing Python source")
+            if path != file.new_path or not path:
+                raise UnknownImpact("verification requires an existing file")
             if path in edits:
                 raise UnknownImpact("verification requires one patch section per file")
-            original, _ = self.original(path)
+            if path.startswith("sqlglot/") and path.endswith(".py"):
+                original, _ = self.original(path)
+            elif fixtures and path.startswith("tests/fixtures/") and path.endswith(".sql"):
+                original = (self.pinned / path).read_bytes().decode("utf-8")
+            else:
+                raise UnknownImpact("unsupported verification input")
             edits[path] = file.apply(original).encode("utf-8")
         return edits
 
@@ -472,6 +488,19 @@ class ImpactIndex:
                 return False
         return True
 
+    def optimizer_query_scope(self, edits, node_id):
+        """Limit automatic partial replay to a single optimizer condition."""
+        if len(edits) != 1 or not self.tpc_replay_scope(edits, node_id):
+            return False
+        path, patched = next(iter(edits.items()))
+        bit = self.test_bits[node_id]
+        if (not path.startswith("sqlglot/optimizer/") or self.declaration_readers(path) & bit
+                or not self.warm_plan(edits, [node_id])):
+            return False
+        _, before = self.original(path)
+        after = ast.parse(patched, type_comments=True)
+        return bool(comparison_edits(before, after) or integer_guard_edit(before, after))
+
     def query_cases(self, edits, node_id, profile):
         """Map supported body edits to isolated cases, refusing setup changes."""
         bit = self.test_bits.get(node_id, 0)
@@ -500,11 +529,21 @@ class ImpactIndex:
             return None
         return [i for i in range(len(profile["times"])) if cases & (2 << i)]
 
-    def warm_plan(self, edits, node_ids):
+    def warm_plan(self, edits, node_ids, *, strict=False):
         """Restrict in-memory replacement to plain, post-import function bodies."""
         test_mask = 0
         for node_id in node_ids:
             test_mask |= self.test_bits.get(node_id, 0)
+        if strict:
+            incomplete, _ = self.observations("incomplete", "*")
+            if test_mask.bit_count() != len(node_ids) or test_mask & (self.unreliable_mask | self.isolated_mask | incomplete):
+                return None
+            if len(edits) == 1:
+                path = next(iter(edits))
+                if path.startswith("tests/fixtures/") and path.endswith(".sql"):
+                    if 0 not in self.startup.get(path, ()) and self.line_masks(path).get(0, 0) & test_mask == test_mask:
+                        return {}
+                    return None
         plan = {}
         for path, patched in edits.items():
             if self.line_masks(path).get(0, 0) & test_mask or 0 in self.startup.get(path, ()):
@@ -515,6 +554,8 @@ class ImpactIndex:
                 if (not isinstance(old, FUNCTIONS) or old.decorator_list
                         or any(old.lineno <= line <= old.end_lineno for line in self.startup.get(path, ()))):
                     return None
+                if strict and not changed_statements(old, new):
+                    return None
                 locations.append((old.name, old.lineno, new.lineno))
             if locations:
                 plan[path] = locations
@@ -524,7 +565,7 @@ class ImpactIndex:
         path = file.old_path
         fixture = file.new_path or path
         if fixture and fixture.startswith("tests/fixtures/"):
-            return self.fixture_impact(file, fixture)
+            return self.fixture_impact(file, fixture, normalize=compare_operands)
         if path is None or file.new_path is None:
             raise UnknownImpact("added or deleted file")
         if path in {"README.md", "CHANGELOG.md"} or (path.startswith("posts/") and path.endswith(".md")):
@@ -539,12 +580,17 @@ class ImpactIndex:
             return self.test_source_impact(file, path)
         raise UnknownImpact("unmapped file")
 
-    def fixture_impact(self, file, path):
+    def fixture_impact(self, file, path, *, normalize=False):
         if 0 in self.startup.get(path, ()):
             raise UnknownImpact("fixture read during collection")
         readers = self.line_masks(path).get(0, 0) | self.isolated.get(path, {}).get(0, 0)
         if file.old_path and file.new_path:
             if readers:
+                if normalize and file.old_path == file.new_path and path.endswith(".sql"):
+                    original = (self.pinned / path).read_bytes().decode("utf-8")
+                    patched = file.apply(original)
+                    proved = unaffected_fixture_readers(path, original, patched, self.line_masks, self.isolated)
+                    return readers & ~(proved & ~self.unreliable_mask)
                 return readers
         elif self.fixture_directories and path.endswith(".sql"):
             source = self.pinned / path
@@ -562,6 +608,19 @@ class ImpactIndex:
                 readers |= self.line_masks(directory).get(0, 0) | self.isolated.get(directory, {}).get(0, 0)
             return readers
         raise UnknownImpact("unmapped fixture")
+
+    def fixture_case_scope(self, path, node_id):
+        """Only replay a case when its test read the fixture through the pair loader."""
+        bit = self.test_bits.get(node_id, 0)
+        if (not bit or bit & self.unreliable_mask or 0 in self.startup.get(path, ())
+                or int(self.shared.get(path, {}).get("0", "0"), 16) & bit
+                or self.isolated.get(path, {}).get(0, 0) & bit):
+            return False
+        reads = self.line_masks(path).get(0, 0)
+        pairs = self.line_masks(f"fixture-sql:pairs:{path}").get(0, 0)
+        raw = self.line_masks(f"fixture-sql:raw:{path}").get(0, 0)
+        lines = self.line_masks(f"fixture-sql:lines:{path}").get(0, 0)
+        return bool(bit & reads & pairs & ~(raw | lines))
 
     def test_source_impact(self, file, path):
         original, tree = self.original(path)

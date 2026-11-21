@@ -3,14 +3,20 @@
 import json
 import math
 import sys
+import time
 from operator import itemgetter
 from pathlib import Path
 
+from case_replay import PREFIX as OPTIMIZER_FIXTURE_PREFIX, fixture_cases, optimizer_cases
 from fallback import FallbackIndex
 from impact import ImpactIndex
 from optimizer_replay import SOURCE as OPTIMIZER_SOURCE, TEST as OPTIMIZER_TEST
+from parser_replay import PARSER_TEST
 from patch_parser import parse_patch
+from replay_costs import load_replay_costs
+from semantic import TPC_TESTS
 from verify import Verification
+from warm_verify import fast_test_id
 
 DATA = Path("/data")
 PINNED = Path("/pinned")
@@ -20,10 +26,13 @@ SUBPROCESS_PROFILE = Path(__file__).with_name("subprocess.json")
 VERIFICATION = Path(__file__).with_name("verification.json")
 QUERY_PROFILES = Path(__file__).with_name("query-profiles.json.gz")
 CHECKPOINTS = Path(__file__).with_name("optimizer-checkpoints.json.gz")
+PARSER_PROFILE = Path(__file__).with_name("parser-profile.json.gz")
+REPLAY_COSTS = Path(__file__).with_name("replay-costs.json")
 STRUCTURAL_REFERENCES = Path(__file__).with_name("structural-references.json")
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
 COLLECTION_PROBE_COST_MS = 3_000
+WARM_BATCH_SECONDS = 12
 
 
 def schedule(tests: list[tuple[int, int]]) -> list[list[int]]:
@@ -122,7 +131,44 @@ def schedule_cost(workers, durations):
     return max((sum(durations[n] for n in group) for group in workers), default=0) + WORKER_COST_MS * len(workers)
 
 
-def main(*, replay=False, checkpoints=True) -> None:
+def warm_prefix(selected, always, node_ids, durations, saving_for, cost_model=None):
+    """Choose an affordable roster in suite order, keeping unresolved later tests."""
+    roster = []
+    cost = 400
+    for number in sorted(selected):
+        node_id = node_ids[number]
+        if number in always or not fast_test_id(node_id):
+            break
+        measured = cost_model.test_ms(node_id) if cost_model is not None else None
+        estimate = durations[number] if measured is None else measured
+        if estimate > (750 if measured is None else 1_250):
+            break
+        cost += estimate + 8
+        if cost > 2_000 or len(roster) >= 32:
+            break
+        roster.append(number)
+
+    best = (0, 0, frozenset())
+    for length in sorted({1, 2, 4, 8, 16, len(roster)}):
+        if not 0 < length <= len(roster):
+            continue
+        removal = frozenset(roster[:length])
+        savings = saving_for(selected, removal)
+        cost = cost_model.estimate_ms(node_ids[n] for n in roster[:length]) if cost_model is not None else None
+        if cost is None:
+            # Mixed measured and unmeasured rosters must pay the original conservative estimate.
+            if any(durations[n] > 750 for n in removal):
+                continue
+            cost = 400 + sum(durations[n] + 8 for n in removal)
+            if cost > 1_750:
+                continue
+        benefit = savings - cost
+        if benefit > best[0]:
+            best = (benefit, savings, removal)
+    return best
+
+
+def main(*, replay=False, checkpoints=True, warm_probes=True, diagnostics=False) -> None:
     tests = json.loads((DATA / "tests.json").read_text(encoding="utf-8"))["tests"]
     try:
         impact = ImpactIndex(PINNED, COVERAGE, tests, ISOLATION, SUBPROCESS_PROFILE)
@@ -130,10 +176,11 @@ def main(*, replay=False, checkpoints=True) -> None:
         print(f"coverage unavailable: {error}", file=sys.stderr)
         impact = None
     try:
-        query_path = QUERY_PROFILES if replay else None
+        query_path = QUERY_PROFILES if replay or checkpoints else None
         verification = Verification(
             PINNED, json.loads(VERIFICATION.read_bytes()), query_path,
             CHECKPOINTS if checkpoints else None,
+            fast=warm_probes, parser_path=PARSER_PROFILE if checkpoints else None,
         )
     except (OSError, ValueError):
         verification = None
@@ -144,16 +191,27 @@ def main(*, replay=False, checkpoints=True) -> None:
         reverse=True,
     )
     durations = dict(timed_tests)
+    by_duration = {n: i for i, (n, _) in enumerate(timed_tests)}
     node_ids = {test["number"]: test["id"] for test in tests}
-    optimizer_test = next((n for n, node in node_ids.items() if node == OPTIMIZER_TEST), None)
+    numbers_by_id = {node: n for n, node in node_ids.items()}
+    optimizer_test = numbers_by_id.get(OPTIMIZER_TEST)
+    parser_test = numbers_by_id.get(PARSER_TEST)
+    tpc_tests = {numbers_by_id[node] for node in TPC_TESTS if node in numbers_by_id}
+    case_tests = {n for n, node in node_ids.items() if node.startswith(OPTIMIZER_FIXTURE_PREFIX)}
     schedules = {None: schedule(timed_tests)}
     full_cost = schedule_cost(schedules[None], durations)
     plans = []
 
     def workers_for(selected):
         if selected not in schedules:
-            schedules[selected] = schedule([test for test in timed_tests if test[0] in selected])
+            jobs = [timed_tests[by_duration[n]] for n in sorted(selected, key=by_duration.__getitem__)]
+            schedules[selected] = schedule(jobs)
         return schedules[selected]
+
+    def saving_for(selected, removal):
+        before = schedule_cost(workers_for(selected), durations)
+        after = schedule_cost(workers_for(selected - removal), durations)
+        return before - after
 
     # Resolve structural fallbacks throughout the batch before spending the
     # remaining verification budget on candidates that already have a schedule.
@@ -195,35 +253,103 @@ def main(*, replay=False, checkpoints=True) -> None:
         except (OSError, ValueError, SyntaxError, RecursionError, ImportError):
             pass
 
-    verified_checkpoints = set()
-    if checkpoints and verification is not None and optimizer_test is not None:
+    verified_by_commit = {}
+    if checkpoints and verification is not None:
         checks = []
         for commit_id, files, selected, scoped in plans:
-            if (not selected or scoped or optimizer_test not in selected - impact.always
-                    or len(files) != 1 or files[0].old_path != OPTIMIZER_SOURCE
-                    or files[0].new_path != OPTIMIZER_SOURCE):
+            if not selected or scoped or len(files) != 1:
                 continue
-            before_cost = schedule_cost(workers_for(selected), durations)
-            after_cost = schedule_cost(workers_for(selected - {optimizer_test}), durations)
-            if before_cost - after_cost >= 3_000:
-                checks.append((before_cost - after_cost, commit_id, files))
+            path = files[0].old_path
+            if not path or path != files[0].new_path:
+                continue
+            if path.startswith("sqlglot/") and path.endswith(".py"):
+                targets = {parser_test}
+                if path.startswith("sqlglot/optimizer/"):
+                    targets.update(tpc_tests | case_tests)
+            elif path.startswith("tests/fixtures/optimizer/") and path.endswith(".sql"):
+                targets = case_tests
+            else:
+                continue
+            for number in sorted((targets & selected) - impact.always):
+                savings = saving_for(selected, {number})
+                minimum = 1_800 if number in case_tests else 3_000
+                if savings >= minimum:
+                    checks.append((savings, commit_id, files, selected, number))
 
         # Verification has a shared CPU budget. Spend it where a pass can save the most.
-        for savings, commit_id, files in sorted(checks, key=itemgetter(0), reverse=True):
+        for _, commit_id, files, selected, number in sorted(checks, key=itemgetter(0), reverse=True):
             try:
+                savings = saving_for(selected - verified_by_commit.get(commit_id, set()), {number})
+                if number in case_tests:
+                    if savings < 1_800:
+                        continue
+                    node = node_ids[number]
+                    profile = verification.queries.get(node)
+                    if not profile:
+                        continue
+                    path = files[0].old_path
+                    edits = impact.patched_files(files, fixtures=True)
+                    if path.startswith("tests/fixtures/"):
+                        cases = fixture_cases(PINNED, edits, node) if impact.fixture_case_scope(path, node) else None
+                    else:
+                        cases = optimizer_cases(PINNED, edits, node, impact, profile)
+                    if cases and verification.fixture_cases_pass(edits, node, cases, savings):
+                        verified_by_commit.setdefault(commit_id, set()).add(number)
+                    continue
+                if savings < 3_000:
+                    continue
                 edits = impact.patched_files(files)
-                if impact.tpc_replay_scope(edits, OPTIMIZER_TEST):
+                if number == parser_test:
+                    path = files[0].old_path
+                    if (0 not in impact.startup.get(path, ())
+                            and not impact.declaration_readers(path) & impact.test_bits.get(PARSER_TEST, 0)
+                            and impact.warm_plan(edits, [PARSER_TEST])
+                            and verification.parser_passes(edits, savings)):
+                        verified_by_commit.setdefault(commit_id, set()).add(number)
+                    continue
+                if number == optimizer_test and OPTIMIZER_SOURCE in edits and impact.tpc_replay_scope(edits, OPTIMIZER_TEST):
                     before, _ = impact.original(OPTIMIZER_SOURCE)
                     if verification.optimizer_passes(before.encode("utf-8"), edits, savings):
-                        verified_checkpoints.add(commit_id)
+                        verified_by_commit.setdefault(commit_id, set()).add(number)
+                        continue
+                node = node_ids[number]
+                if impact.optimizer_query_scope(edits, node):
+                    cases = impact.query_cases(edits, node, verification.queries.get(node))
+                    if cases and verification.queries_pass(edits, node, cases, savings, optimizer_only=True):
+                        verified_by_commit.setdefault(commit_id, set()).add(number)
+            except (OSError, ValueError, SyntaxError, RecursionError, KeyError, TypeError):
+                pass
+
+    if warm_probes and verification is not None and verification.warm is not None:
+        costs = load_replay_costs(REPLAY_COSTS)
+        jobs = []
+        for commit_id, files, selected, scoped in plans:
+            if not selected or scoped or len(files) != 1:
+                continue
+            # Keep verified earlier candidates in order when checking later candidates.
+            # Their state changes can still matter to a later test.
+            benefit, savings, roster = warm_prefix(selected, impact.always, node_ids, durations, saving_for, costs)
+            if benefit:
+                jobs.append((benefit, savings, commit_id, files, roster))
+        deadline = time.monotonic() + WARM_BATCH_SECONDS
+        for _, savings, commit_id, files, roster in sorted(jobs, key=itemgetter(0), reverse=True):
+            remaining = deadline - time.monotonic()
+            if remaining <= 1.45:
+                break
+            try:
+                edits = impact.patched_files(files, fixtures=True)
+                ids = [node_ids[n] for n in sorted(roster)]
+                plan = impact.warm_plan(edits, ids, strict=True)
+                timeout = min(2.0, remaining - 1.3, savings / 2_000)
+                if plan is not None and verification.warm_passes(edits, plan, ids, timeout):
+                    verified_by_commit.setdefault(commit_id, set()).update(roster)
             except (OSError, ValueError, SyntaxError, RecursionError, KeyError, TypeError):
                 pass
 
     fallback = selected_count = 0
     for commit_id, files, selected, scoped in plans:
-        verified = frozenset()
-        if commit_id in verified_checkpoints:
-            verified = frozenset({optimizer_test})
+        verified = frozenset(verified_by_commit.get(commit_id, ()))
+        if verified:
             selected -= verified
         if replay and verification is not None and selected and not scoped:
             try:
@@ -236,6 +362,12 @@ def main(*, replay=False, checkpoints=True) -> None:
         workers = workers_for(selected)
         if selected is not None and len(workers) > 1:
             workers = add_to_slack(workers, durations, impact.nearby(files) - verified)
+        if diagnostics:
+            busiest = max(workers, key=lambda group: sum(durations[n] for n in group), default=[])
+            drivers = sorted(busiest, key=durations.__getitem__, reverse=True)[:3]
+            print(json.dumps({"commit": commit_id, "schedule_ms": schedule_cost(workers, durations),
+                              "fallback": selected is None, "verified": len(verified),
+                              "busiest_tests": [[node_ids[n], durations[n]] for n in drivers]}), file=sys.stderr)
         print(json.dumps({"commit": commit_id, "workers": workers}, separators=(",", ":")))
     print(f"selected {selected_count} tests across all patches, {fallback} full-suite fallbacks", file=sys.stderr)
     if verification is not None:
@@ -247,6 +379,9 @@ if __name__ == "__main__":
 
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--replay", action="store_true", help="run optional test and query probes")
-    parser.add_argument("--no-checkpoints", action="store_true", help="skip targeted optimizer checkpoint verification")
+    parser.add_argument("--no-checkpoints", action="store_true", help="skip targeted slow-test verification")
+    parser.add_argument("--no-warm-probes", action="store_true", help="skip default cost-gated verification")
+    parser.add_argument("--diagnostics", action="store_true", help="report per-patch schedule costs on stderr")
     args = parser.parse_args()
-    main(replay=args.replay, checkpoints=not args.no_checkpoints)
+    main(replay=args.replay, checkpoints=not args.no_checkpoints,
+         warm_probes=not args.no_warm_probes, diagnostics=args.diagnostics)

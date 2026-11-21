@@ -13,3 +13,8 @@
 !build_isolation.py
 !warm_verify.py
 !build_subprocess_profiles.py
+!bytecode_coverage.py
+!case_replay.py
+!fixture_impact.py
+!parser_replay.py
+!replay_costs.py
