@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 from query_replay import load_profiles, run_cases
-from semantic import TPC_TESTS, show_closure
+from semantic import TPC_TESTS, module_name, show_closure
 from warm_verify import WarmProcess
 
 
@@ -42,8 +42,22 @@ def config_value(value, depth=0):
     return None
 
 
-def snapshot(modules):
+def unordered_tuple_bindings(source):
+    """Find the top-level tuple bindings whose order comes from a set."""
+    names = set()
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+            call = node.value
+            if (isinstance(call.func, ast.Name) and call.func.id == "tuple"
+                    and len(call.args) == 1 and isinstance(call.args[0], ast.Set) and not call.keywords):
+                names.update(target.id for target in node.targets if isinstance(target, ast.Name))
+    return sorted(names)
+
+
+def snapshot(modules, unordered_by_module=None):
     fields = {}
+    if unordered_by_module is None:
+        unordered_by_module = {}
 
     def record(prefix, obj, module, unordered=()):
         for name, value in vars(obj).items():
@@ -78,15 +92,9 @@ def snapshot(modules):
         module = importlib.import_module(name)
         # tuple({...}) can produce different orders across independently imported
         # interpreters. Explicit tuples still retain their order in the signature.
-        unordered = set()
-        tree = ast.parse(Path(module.__file__).read_bytes())
-        for node in tree.body:
-            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
-                call = node.value
-                if (isinstance(call.func, ast.Name) and call.func.id == "tuple"
-                        and len(call.args) == 1 and isinstance(call.args[0], ast.Set) and not call.keywords):
-                    unordered.update(target.id for target in node.targets if isinstance(target, ast.Name))
-        record(name + "::", module, name, unordered)
+        if name not in unordered_by_module:
+            unordered_by_module[name] = unordered_tuple_bindings(Path(module.__file__).read_bytes())
+        record(name + "::", module, name, unordered_by_module[name])
     return fields
 
 
@@ -156,6 +164,31 @@ def pytest_passes(ids):
     return sorted(set(ids) & results.calls & results.finished - results.failed)
 
 
+def pytest_collection():
+    import pytest
+
+    class Collection:
+        def __init__(self):
+            self.errors = set()
+            self.tests = []
+
+        def pytest_collectreport(self, report):
+            if report.failed:
+                self.errors.add(report.nodeid)
+
+        def pytest_collection_finish(self, session):
+            self.tests = [item.nodeid for item in session.items]
+
+    report = Collection()
+    status = pytest.main(
+        ["-q", "--collect-only", "--continue-on-collection-errors", "-p", "no:cacheprovider", "--tb=no", "tests"],
+        plugins=[report],
+    )
+    if status == 0 or (status in (1, 2, 5) and report.errors):
+        return report.tests, sorted(report.errors)
+    return None
+
+
 class Verification:
     def __init__(self, pinned, baseline, query_path=None):
         self.pinned = pinned
@@ -215,17 +248,38 @@ class Verification:
         return None
 
     def changed_state(self, edits, *, entries=False):
-        operation = lambda: snapshot(self.baseline["modules"])
+        modules = self.baseline["modules"]
+        unordered = self.baseline.get("unordered_tuple_bindings", {})
         if self.pristine is None:
-            self.pristine = self.run({}, operation, 2.5)
+            self.pristine = self.run({}, lambda: snapshot(modules, unordered), 2.5)
         if self.pristine is None or self.pristine.keys() != self.baseline["state"].keys():
             return None
-        current = self.run(edits, operation, 2.5)
+        # Only edited modules can change the syntax used to construct a tuple.
+        unchanged = unordered.copy()
+        for path in edits:
+            unchanged.pop(module_name(path), None)
+        current = self.run(edits, lambda: snapshot(modules, unchanged), 2.5)
         if current is None:
             return None
         old = self.pristine
         return {key for key in old.keys() | current.keys()
                 if (entries or "#" not in key) and old.get(key) != current.get(key)}
+
+    def collection_impact(self, edits, tests):
+        result = self.run(edits, pytest_collection, 6.0)
+        if result is None:
+            return None
+        collected, errors = map(set, result)
+        files = {test["file"] for test in tests}
+        # An error without a file or directory cannot be scoped reliably.
+        if any(not error or not any(path == error or path.startswith(error.rstrip("/") + "/")
+                                    for path in files) for error in errors):
+            return None
+        return {
+            test["number"] for test in tests
+            if test["id"] not in collected or any(test["file"] == error
+                or test["file"].startswith(error.rstrip("/") + "/") for error in errors)
+        }
 
     def exact_passes(self, edits, ids, timeout, plan=None, cold=()):
         passed = []
@@ -266,10 +320,10 @@ class Verification:
 
 
 if __name__ == "__main__":
-    from semantic import module_name
-
     modules = sorted({module_name(path.as_posix()) for path in Path("sqlglot").rglob("*.py")
                       if path.name != "__main__.py"})
-    state = snapshot(modules)
+    unordered = {}
+    state = snapshot(modules, unordered)
     tpc = {name: tpc_signatures(dataset) for name, dataset in TPC_TESTS.items()}
-    Path(sys.argv[1]).write_text(json.dumps({"modules": modules, "state": state, "tpc": tpc}), encoding="utf-8")
+    data = {"modules": modules, "state": state, "tpc": tpc, "unordered_tuple_bindings": unordered}
+    Path(sys.argv[1]).write_text(json.dumps(data), encoding="utf-8")

@@ -21,6 +21,10 @@ FROM coverage AS isolation
 COPY build_isolation.py /
 RUN python /build_isolation.py /coverage.json.gz /isolated.json.gz
 
+FROM coverage AS subprocess-profiles
+COPY build_subprocess_profiles.py /
+RUN python /build_subprocess_profiles.py /coverage.json.gz /subprocess.json
+
 FROM coverage-deps AS fingerprints
 COPY semantic.py verify.py query_replay.py warm_verify.py /
 WORKDIR /pinned
@@ -34,10 +38,13 @@ ENV PYTHONPATH=/pinned PYTHONDONTWRITEBYTECODE=1 SKIP_INTEGRATION=0 OPENBLAS_NUM
 RUN python /query_replay.py /query-profiles.json.gz
 
 FROM coverage-deps
-COPY selector.py patch_parser.py impact.py semantic.py verify.py query_replay.py warm_verify.py /app/
+COPY selector.py patch_parser.py impact.py fallback.py semantic.py verify.py query_replay.py warm_verify.py /app/
 COPY --from=coverage /coverage.json.gz /app/coverage.json.gz
 COPY --from=isolation /isolated.json.gz /app/isolated.json.gz
+COPY --from=subprocess-profiles /subprocess.json /app/subprocess.json
 COPY --from=fingerprints /verification.json /app/verification.json
 COPY --from=queries /query-profiles.json.gz /app/query-profiles.json.gz
+# Import probes reuse pinned bytecode and verify the source hash in patched overlays.
+RUN python -m compileall -q --invalidation-mode checked-hash /pinned/sqlglot
 ENV PYTHONDONTWRITEBYTECODE=1 SKIP_INTEGRATION=0 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 PYTHON_CPU_COUNT=2
 CMD ["python", "/app/selector.py"]

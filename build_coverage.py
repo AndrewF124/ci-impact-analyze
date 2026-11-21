@@ -22,6 +22,7 @@ from unittest.mock import patch
 from semantic import SemanticTrace, TPC_TESTS
 
 SOURCE_COMMIT = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
+DIALECT_REGISTRY = {"_Dialect.get", "_Dialect.__getitem__", "_Dialect._try_load", "_Dialect.classes"}
 
 
 class Coverage:
@@ -59,6 +60,15 @@ class Coverage:
             self.startup_lines.setdefault(path, set()).add(line)
 
     def start(self, code, _offset):
+        if (
+            code.co_filename == "<frozen importlib._bootstrap>"
+            and code.co_name == "_find_and_load"
+        ):
+            name = sys._getframe(1).f_locals.get("name")
+            if isinstance(name, str) and name.startswith("sqlglot."):
+                # This runs before resolution, including attempts to load absent modules.
+                self.record("import:" + name, 0)
+            return None
         if path := self.source_path(code.co_filename):
             if not sys.monitoring.get_local_events(sys.monitoring.COVERAGE_ID, code):
                 sys.monitoring.set_local_events(
@@ -66,6 +76,15 @@ class Coverage:
                 )
             if code.co_name != "<module>":
                 self.record(path, code.co_firstlineno)
+            if path == "sqlglot/dialects/dialect.py" and code.co_qualname in DIALECT_REGISTRY:
+                if code.co_name == "classes":
+                    self.record("dialect:registry", 0)
+                else:
+                    key = sys._getframe(1).f_locals.get("key")
+                    if isinstance(key, str):
+                        self.record("dialect:" + str.__str__(key).lower(), 0)
+                # Cached lookups can use several different keys in one test.
+                return None
             tpc = (self.mask | self.shared_mask) & self.tpc_mask
             if tpc and path.startswith("sqlglot/optimizer/"):
                 frame = sys._getframe(1)
@@ -108,6 +127,28 @@ class Coverage:
             return
         if event in {"subprocess.Popen", "os.exec", "os.posix_spawn"}:
             self.incomplete |= self.mask | self.shared_mask
+        if event in {"os.listdir", "os.scandir"}:
+            directory = args[0]
+            if directory is None:
+                directory = "."
+            if isinstance(directory, int):
+                try:
+                    directory = os.readlink(f"/proc/self/fd/{directory}")
+                except OSError:
+                    directory = None
+            if isinstance(directory, (str, bytes)):
+                path = self.source_path(os.path.abspath(os.fsdecode(directory)))
+                if path and (path == "sqlglot" or path.startswith(("sqlglot/", "tests/fixtures"))):
+                    caller = sys._getframe(1).f_code
+                    # The import cache only observes names requested through the finder.
+                    if (caller.co_filename == "<frozen importlib._bootstrap_external>"
+                            and caller.co_name == "_fill_cache"):
+                        return
+                    # Pytest enumerates directories looking for Python tests.
+                    # SQL fixture membership cannot alter that enumeration.
+                    if caller.co_name == "scandir" and caller.co_filename.endswith("/_pytest/pathlib.py"):
+                        return
+                    self.record(path, 0)
         if event == "open":
             filename, _mode, flags = args
             if isinstance(filename, (str, bytes)) and (flags & os.O_ACCMODE) != os.O_WRONLY:
@@ -124,6 +165,17 @@ class Coverage:
                         and caller.f_back.f_code.co_name == "get_code"
                     ):
                         return
+                    if path.startswith("tests/") and path.endswith(".py"):
+                        # Pytest reads test sources when compiling rewritten
+                        # assertions. Keep reads performed by test code itself.
+                        frame = caller
+                        for _ in range(4):
+                            if frame is None:
+                                break
+                            if (frame.f_code.co_name == "_rewrite_test"
+                                    and frame.f_code.co_filename.endswith("/_pytest/assertion/rewrite.py")):
+                                return
+                            frame = frame.f_back
                     self.record(path, 0)
 
     def begin(self) -> None:
@@ -304,6 +356,8 @@ def measure(output: Path, targets=None) -> None:
                 "tests": list(contexts.tests),
                 "unreliable": sorted(unmeasured),
                 "durations": contexts.durations,
+                "fixture_directories": True,
+                "module_discovery": True,
                 "startup_lines": {path: sorted(lines) for path, lines in coverage.startup_lines.items()},
                 **coverage.encoded(),
             },

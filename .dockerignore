@@ -4,9 +4,11 @@
 !selector.py
 !patch_parser.py
 !impact.py
+!fallback.py
 !build_coverage.py
 !semantic.py
 !verify.py
 !query_replay.py
 !build_isolation.py
 !warm_verify.py
+!build_subprocess_profiles.py

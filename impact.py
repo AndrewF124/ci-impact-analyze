@@ -3,20 +3,30 @@
 from __future__ import annotations
 
 import ast
+import copy
 import gzip
 import json
 from functools import cache
 from pathlib import Path
+from types import CodeType
 
 from patch_parser import FilePatch, parse_patch
-from semantic import comparison_edits, derived_field_edits, literal_field_edits, site_key
+from semantic import MISSING, Shape, comparison_edits, derived_field_edits, literal, literal_field_edits, site_key
 
 SOURCE_COMMIT = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
 CALLABLES = (*FUNCTIONS, ast.Lambda)
 YIELDS = (ast.Yield, ast.YieldFrom)
 OPERATOR_KINDS = (ast.operator, ast.boolop, ast.cmpop, ast.unaryop)
-EXPRESSION_FIELDS = {ast.If: "test", ast.Assign: "value", ast.AnnAssign: "value", ast.Return: "value"}
+EXPRESSION_FIELDS = {
+    ast.If: "test",
+    ast.Assign: "value",
+    ast.AnnAssign: "value",
+    ast.Return: "value",
+    ast.Expr: "value",
+    ast.For: "iter",
+    ast.AugAssign: "value",
+}
 
 
 class UnknownImpact(ValueError):
@@ -40,6 +50,17 @@ def changed_callables(before: ast.AST, after: ast.AST) -> list[tuple[ast.AST, as
                 if any(isinstance(node, YIELDS) for function in (old, new) for node in ast.walk(function)):
                     # A generator can be called without running any of its body.
                     raise UnknownImpact("changed generator function")
+                if isinstance(old, FUNCTIONS):
+                    start = len(callables)
+                    try:
+                        compare(old_body, new_body)
+                    except UnknownImpact:
+                        del callables[start:]
+                    # Keep nested closures separate when their bindings and
+                    # expression shape are unchanged by the patch.
+                    if len(callables) > start and all(changed_statements(a, b) for a, b in callables[start:]):
+                        return
+                    del callables[start:]
                 callables.append((old, new))
         elif isinstance(old, ast.AST):
             for field, value in ast.iter_fields(old):
@@ -88,6 +109,9 @@ def changed_statements(before: ast.AST, after: ast.AST) -> list[tuple[int, int]]
                 replacement = getattr(new, field)
                 if field == expression_field and isinstance(value, ast.expr):
                     if ast.dump(value) != ast.dump(replacement):
+                        # A bare string can supply a function's __doc__ without running it.
+                        if isinstance(old, ast.Expr) and not isinstance(value, ast.Call):
+                            return False
                         if not same_expression_shape(value, replacement):
                             return False
                         spans.append((old.lineno, value.end_lineno))
@@ -101,8 +125,48 @@ def changed_statements(before: ast.AST, after: ast.AST) -> list[tuple[int, int]]
     return spans if isinstance(before, FUNCTIONS) and compare(before.body, after.body) else []
 
 
+def only_expected_values(before, after):
+    """Recognize literal expectation edits while leaving the test program intact."""
+    assertions = {"assertEqual", "assertDictEqual", "assertListEqual", "assertTupleEqual", "assertSequenceEqual"}
+
+    def normalized(function):
+        function = copy.deepcopy(function)
+        expected = []
+        for node in ast.walk(function):
+            if (isinstance(node, ast.Call) and len(node.args) >= 2
+                    and isinstance(node.func, ast.Attribute) and node.func.attr in assertions
+                    and isinstance(node.func.value, ast.Name) and node.func.value.id == "self"
+                    and literal(node.args[1]) is not MISSING):
+                expected.append(node.args[1])
+        return ast.dump(Shape(expected).visit(function))
+
+    return normalized(before) == normalized(after)
+
+
+def same_bytecode(before, after):
+    """Compare compiled behavior and binding metadata, ignoring source positions."""
+    fields = (
+        "co_code", "co_flags", "co_names", "co_varnames", "co_freevars", "co_cellvars",
+        "co_argcount", "co_posonlyargcount", "co_kwonlyargcount", "co_exceptiontable",
+        "co_name", "co_qualname",
+    )
+    if any(getattr(before, name) != getattr(after, name) for name in fields):
+        return False
+    if len(before.co_consts) != len(after.co_consts):
+        return False
+    for old, new in zip(before.co_consts, after.co_consts):
+        if type(old) is not type(new):
+            return False
+        if isinstance(old, CodeType):
+            if not same_bytecode(old, new):
+                return False
+        elif repr(old) != repr(new):
+            return False
+    return True
+
+
 class ImpactIndex:
-    def __init__(self, pinned: Path, coverage_path: Path, tests: list[dict], isolation_path=None):
+    def __init__(self, pinned: Path, coverage_path: Path, tests: list[dict], isolation_path=None, subprocess_path=None):
         self.pinned = pinned
         with gzip.open(coverage_path, "rt", encoding="utf-8") as stream:
             raw = json.load(stream)
@@ -115,6 +179,8 @@ class ImpactIndex:
         self.shared = raw["shared"]
         self.startup = raw["startup_lines"]
         self.semantic = raw.get("semantic", {})
+        self.fixture_directories = raw.get("fixture_directories", False)
+        self.module_discovery = raw.get("module_discovery", False)
         self.isolated = {}
         if isolation_path is not None:
             try:
@@ -128,9 +194,24 @@ class ImpactIndex:
                     hits = self.isolated.setdefault(path, {})
                     for line in lines:
                         hits[line] = hits.get(line, 0) | bit
+        self.subprocess_imports = {}
+        child_profiles = {}
+        if subprocess_path is not None:
+            try:
+                child_profiles = json.loads(subprocess_path.read_bytes())
+            except (OSError, ValueError):
+                pass
+        for node_id, profile in child_profiles.items():
+            bit = test_bits.get(node_id, 0)
+            for path in profile["imported"]:
+                self.subprocess_imports[path] = self.subprocess_imports.get(path, 0) | bit
+            for path, lines in profile["lines"].items():
+                hits = self.isolated.setdefault(path, {})
+                for line in lines:
+                    hits[line] = hits.get(line, 0) | bit
         self.always = set()
         self.numbers = {}
-        unreliable = set(raw["unreliable"])
+        unreliable = set(raw["unreliable"]) - child_profiles.keys()
         for test in tests:
             node_id, number = test["id"], test["number"]
             if node_id in unreliable or node_id not in test_bits:
@@ -151,6 +232,10 @@ class ImpactIndex:
         contents = (self.pinned / path).read_bytes()
         return contents.decode("utf-8"), ast.parse(contents, filename=path, type_comments=True)
 
+    @cache
+    def compiled(self, path):
+        return compile(self.original(path)[0], path, "exec", dont_inherit=True)
+
     def observations(self, kind: str, key: str) -> tuple[int, bool]:
         bits, startup = self.semantic.get(kind, {}).get(key, ("0", False))
         return int(bits, 16), startup
@@ -168,18 +253,23 @@ class ImpactIndex:
         uncertain |= incomplete
         return 0 if startup else seen & ~uncertain
 
-    def python_impact(self, file: FilePatch, path: str) -> int:
+    def python_impact(self, file: FilePatch, path: str, *, compare_operands=True) -> int:
         original, before = self.original(path)
         patched = file.apply(original).encode("utf-8")
-        compile(patched, path, "exec", dont_inherit=True)
+        compiled = compile(patched, path, "exec", dont_inherit=True)
         after = ast.parse(patched, filename=path, type_comments=True)
-        callables = changed_callables(before, after)
         lines = self.line_masks(path)
         isolated = self.isolated.get(path, {})
         mask = lines.get(0, 0) | isolated.get(0, 0)
         startup = self.startup.get(path, ())
         if 0 in startup:
             raise UnknownImpact("source read directly during collection")
+        try:
+            callables = changed_callables(before, after)
+        except UnknownImpact:
+            if same_bytecode(self.compiled(path), compiled):
+                return mask
+            raise
         for function, replacement in callables:
             decorators = function.decorator_list if isinstance(function, FUNCTIONS) else ()
             start = min((node.lineno for node in decorators), default=function.lineno)
@@ -192,7 +282,7 @@ class ImpactIndex:
             # A cold import can bind a definition without running its body.
             for line in range(function.lineno + 1, function.end_lineno + 1):
                 isolated_hits |= isolated.get(line, 0)
-            if not hits:
+            if not (hits or isolated_hits):
                 raise UnknownImpact("uncovered function")
             spans = changed_statements(function, replacement)
             statement_hits = 0
@@ -208,7 +298,7 @@ class ImpactIndex:
                     break
                 statement_hits |= span_hits
             function_mask = (statement_hits | isolated_statements) if statement_hits else (hits | isolated_hits)
-            if statement_hits and len(callables) == 1:
+            if compare_operands and statement_hits and len(callables) == 1:
                 function_mask &= ~self.equivalent_comparison(original, patched, path)
             mask |= function_mask
         return mask
@@ -228,7 +318,12 @@ class ImpactIndex:
         if not self.semantic.get("field"):
             return None
         edits = self.patched_files(files)
-        derived = self.derived_impact(edits, verification)
+
+        @cache
+        def changed_state():
+            return verification.changed_state(edits, entries=True)
+
+        derived = self.derived_impact(edits, changed_state)
         if derived is not None:
             return derived
         changes = {}
@@ -239,11 +334,13 @@ class ImpactIndex:
             if not changed or 0 in self.startup.get(path, ()):
                 return None
             changes.update(changed)
-            mask |= self.line_masks(path).get(0, 0)
+            mask |= self.declaration_readers(path)
 
         # Plain declarations can still feed another binding during class creation.
         # Compare a fresh import and require evidence for each state change.
-        state_changes = verification.changed_state(edits)
+        state_changes = changed_state()
+        if state_changes is not None:
+            state_changes = {name for name in state_changes if "#" not in name}
         if state_changes is None or not changes.keys() <= state_changes:
             return None
         for field in state_changes:
@@ -264,7 +361,7 @@ class ImpactIndex:
         mask |= incomplete
         return self.test_numbers(mask) | self.always
 
-    def derived_impact(self, edits, verification):
+    def derived_impact(self, edits, changed_state):
         changes = {}
         mask = 0
         for path, patched in edits.items():
@@ -273,7 +370,7 @@ class ImpactIndex:
             if not allowed or 0 in self.startup.get(path, ()):
                 return None
             changes.update(allowed)
-            mask |= self.line_masks(path).get(0, 0)
+            mask |= self.declaration_readers(path)
         names = {field.rsplit(":", 1)[1] for field in changes}
         if names == {"arg_types"}:
             kind = "required"
@@ -291,7 +388,7 @@ class ImpactIndex:
             return None
         if not self.semantic.get(kind):
             return None
-        state = verification.changed_state(edits, entries=True)
+        state = changed_state()
         expected = {f"{field}#{key}" for field, keys in changes.items() for key in keys}
         if state is None or not expected <= state:
             return None
@@ -322,6 +419,10 @@ class ImpactIndex:
             if isinstance(node, ast.FunctionDef) and node.name in functions[kind]:
                 mask |= incomplete & self.line_masks(source).get(node.lineno, 0)
         return self.test_numbers(mask | uncertain) | self.always
+
+    def declaration_readers(self, path):
+        return (self.line_masks(path).get(0, 0) | self.isolated.get(path, {}).get(0, 0)
+                | self.subprocess_imports.get(path, 0))
 
     def tpc_replay_scope(self, edits: dict[str, bytes], node_id: str) -> bool:
         bit = self.test_bits.get(node_id, 0)
@@ -384,19 +485,78 @@ class ImpactIndex:
                 plan[path] = locations
         return plan or None
 
-    def file_impact(self, file: FilePatch) -> int:
+    def file_impact(self, file: FilePatch, *, compare_operands=True) -> int:
         path = file.old_path
+        fixture = file.new_path or path
+        if fixture and fixture.startswith("tests/fixtures/"):
+            return self.fixture_impact(file, fixture)
         if path is None or file.new_path is None:
             raise UnknownImpact("added or deleted file")
-        if path.startswith("sqlglot/") and path.endswith(".py"):
-            return self.python_impact(file, path)
-        if path.startswith("tests/fixtures/"):
+        if path in {"README.md", "CHANGELOG.md"} or (path.startswith("posts/") and path.endswith(".md")):
+            # Restrict this to existing Markdown so discovery and imports stay unchanged.
             if 0 in self.startup.get(path, ()):
-                raise UnknownImpact("fixture read during collection")
-            readers = self.line_masks(path).get(0, 0)
+                raise UnknownImpact("documentation read during collection")
+            file.apply((self.pinned / path).read_bytes().decode("utf-8"))
+            return self.declaration_readers(path)
+        if path.startswith("sqlglot/") and path.endswith(".py"):
+            return self.python_impact(file, path, compare_operands=compare_operands)
+        if path.startswith("tests/") and Path(path).name.startswith("test_") and path.endswith(".py"):
+            return self.test_source_impact(file, path)
+        raise UnknownImpact("unmapped file")
+
+    def fixture_impact(self, file, path):
+        if 0 in self.startup.get(path, ()):
+            raise UnknownImpact("fixture read during collection")
+        readers = self.line_masks(path).get(0, 0) | self.isolated.get(path, {}).get(0, 0)
+        if file.old_path and file.new_path:
             if readers:
                 return readers
-        raise UnknownImpact("unmapped file")
+        elif self.fixture_directories and path.endswith(".sql"):
+            source = self.pinned / path
+            if file.old_path is None and source.exists():
+                raise UnknownImpact("fixture already exists")
+            if file.old_path and not readers:
+                raise UnknownImpact("deleted fixture had no tracked readers")
+            file.apply(source.read_bytes().decode("utf-8") if file.old_path else "")
+            for parent in Path(path).parents:
+                directory = parent.as_posix()
+                if directory == "tests":
+                    break
+                if 0 in self.startup.get(directory, ()):
+                    raise UnknownImpact("fixture directory listed during collection")
+                readers |= self.line_masks(directory).get(0, 0) | self.isolated.get(directory, {}).get(0, 0)
+            return readers
+        raise UnknownImpact("unmapped fixture")
+
+    def test_source_impact(self, file, path):
+        original, tree = self.original(path)
+        patched = file.apply(original)
+        compile(patched, path, "exec", dont_inherit=True)
+        changes = changed_callables(tree, ast.parse(patched, filename=path, type_comments=True))
+        direct_tests = {}
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef):
+                direct_tests[node] = f"{path}::{node.name}"
+            elif isinstance(node, ast.ClassDef):
+                direct_tests.update((method, f"{path}::{node.name}::{method.name}")
+                                    for method in node.body if isinstance(method, ast.FunctionDef))
+        mask = self.line_masks(path).get(0, 0)
+        startup = self.startup.get(path, ())
+        if 0 in startup:
+            raise UnknownImpact("test source read during collection")
+        for before, after in changes:
+            node = direct_tests.get(before)
+            if (not node or not before.name.startswith("test_") or before.decorator_list
+                    or any(before.lineno <= line <= before.end_lineno for line in startup)
+                    or not only_expected_values(before, after)):
+                raise UnknownImpact("test edit may affect collection or other tests")
+            members = self.test_bits.get(node, 0)
+            if not members:
+                raise UnknownImpact("edited test not in the baseline catalog")
+            mask |= members
+            for line in range(before.lineno, before.end_lineno + 1):
+                mask |= self.line_masks(path).get(line, 0) | self.isolated.get(path, {}).get(line, 0)
+        return mask
 
     def select(self, patch_text: str) -> frozenset[int] | None:
         """Return selected test numbers, or None when the full suite is needed."""
@@ -409,7 +569,8 @@ class ImpactIndex:
         try:
             mask = 0
             for file in files:
-                mask |= self.file_impact(file)
+                # Another changed file can change the operands reaching this site.
+                mask |= self.file_impact(file, compare_operands=len(files) == 1)
         except (ValueError, OSError, SyntaxError, RecursionError):
             return None
         return self.test_numbers(mask) | self.always

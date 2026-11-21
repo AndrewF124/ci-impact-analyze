@@ -6,6 +6,7 @@ import sys
 from operator import itemgetter
 from pathlib import Path
 
+from fallback import FallbackIndex
 from impact import ImpactIndex
 from patch_parser import parse_patch
 from verify import TPC_TESTS, Verification
@@ -14,10 +15,12 @@ DATA = Path("/data")
 PINNED = Path("/pinned")
 COVERAGE = Path(__file__).with_name("coverage.json.gz")
 ISOLATION = Path(__file__).with_name("isolated.json.gz")
+SUBPROCESS_PROFILE = Path(__file__).with_name("subprocess.json")
 VERIFICATION = Path(__file__).with_name("verification.json")
 QUERY_PROFILES = Path(__file__).with_name("query-profiles.json.gz")
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
+COLLECTION_PROBE_COST_MS = 3_000
 
 
 def schedule(tests: list[tuple[int, int]]) -> list[list[int]]:
@@ -120,15 +123,16 @@ def schedule_cost(workers, durations):
     return max((sum(durations[n] for n in group) for group in workers), default=0) + WORKER_COST_MS * len(workers)
 
 
-def main() -> None:
+def main(*, replay=False) -> None:
     tests = json.loads((DATA / "tests.json").read_text(encoding="utf-8"))["tests"]
     try:
-        impact = ImpactIndex(PINNED, COVERAGE, tests, ISOLATION)
+        impact = ImpactIndex(PINNED, COVERAGE, tests, ISOLATION, SUBPROCESS_PROFILE)
     except (OSError, ValueError, KeyError, TypeError, EOFError) as error:
         print(f"coverage unavailable: {error}", file=sys.stderr)
         impact = None
     try:
-        verification = Verification(PINNED, json.loads(VERIFICATION.read_bytes()), QUERY_PROFILES)
+        query_path = QUERY_PROFILES if replay else None
+        verification = Verification(PINNED, json.loads(VERIFICATION.read_bytes()), query_path)
     except (OSError, ValueError):
         verification = None
 
@@ -140,35 +144,77 @@ def main() -> None:
     durations = dict(timed_tests)
     node_ids = {test["number"]: test["id"] for test in tests}
     schedules = {None: schedule(timed_tests)}
-    fallback = selected_count = 0
+    full_cost = schedule_cost(schedules[None], durations)
+    plans = []
+
+    def workers_for(selected):
+        if selected not in schedules:
+            schedules[selected] = schedule([test for test in timed_tests if test[0] in selected])
+        return schedules[selected]
+
+    # Resolve structural fallbacks throughout the batch before spending the
+    # remaining verification budget on candidates that already have a schedule.
     for patch in sorted((DATA / "commits").glob("*.patch")):
         selected = None
         files = []
-        verified = frozenset()
         try:
             if impact is not None:
                 files = parse_patch(patch.read_bytes().decode("utf-8"))
                 selected = impact.select_files(files)
-            if verification is not None and files:
-                if selected is None:
-                    selected = impact.state_impact(files, verification)
-                if selected:
-                    verified = verify_selected(impact, files, selected, verification, durations, node_ids)
-                    selected -= verified
+            if selected is None and verification is not None and files:
+                selected = impact.state_impact(files, verification)
         except (OSError, ValueError, SyntaxError, RecursionError):
             pass
+        plans.append((patch.stem, files, selected, False))
+
+    fallback_index = None
+    for index, (commit_id, files, selected, _) in enumerate(plans):
+        if selected is not None or impact is None or not files:
+            continue
+        try:
+            if fallback_index is None:
+                fallback_index = FallbackIndex(impact, tests)
+            scope = fallback_index.select(files)
+            if scope is None:
+                continue
+            candidates, edits = scope
+            candidates = frozenset(candidates)
+            if edits is not None:
+                if (verification is None
+                        or schedule_cost(workers_for(candidates), durations) + COLLECTION_PROBE_COST_MS >= full_cost):
+                    continue
+                affected = verification.collection_impact(edits, tests)
+                if affected is None:
+                    continue
+                candidates |= affected
+            if schedule_cost(workers_for(candidates), durations) < full_cost:
+                plans[index] = (commit_id, files, candidates, True)
+        except (OSError, ValueError, SyntaxError, RecursionError, ImportError):
+            pass
+
+    fallback = selected_count = 0
+    for commit_id, files, selected, scoped in plans:
+        verified = frozenset()
+        if replay and verification is not None and selected and not scoped:
+            try:
+                verified = verify_selected(impact, files, selected, verification, durations, node_ids)
+                selected -= verified
+            except (OSError, ValueError, SyntaxError, RecursionError):
+                pass
         fallback += selected is None
         selected_count += len(tests) if selected is None else len(selected)
-        if selected not in schedules:
-            schedules[selected] = schedule([test for test in timed_tests if test[0] in selected])
-        workers = schedules[selected]
+        workers = workers_for(selected)
         if selected is not None and len(workers) > 1:
             workers = add_to_slack(workers, durations, impact.nearby(files) - verified)
-        print(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
+        print(json.dumps({"commit": commit_id, "workers": workers}, separators=(",", ":")))
     print(f"selected {selected_count} tests across all patches, {fallback} full-suite fallbacks", file=sys.stderr)
     if verification is not None:
         verification.close()
 
 
 if __name__ == "__main__":
-    main()
+    from argparse import ArgumentParser
+
+    parser = ArgumentParser(description=__doc__)
+    parser.add_argument("--replay", action="store_true", help="run optional test and query probes")
+    main(replay=parser.parse_args().replay)

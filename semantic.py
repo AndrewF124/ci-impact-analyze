@@ -223,6 +223,39 @@ def resolve(node, frame):
     return MISSING
 
 
+def cached_property_comparison(node, parents):
+    if {type(node.ops[0]), SWAPS[type(node.ops[0])]} not in (
+        {ast.Is, ast.Eq}, {ast.IsNot, ast.NotEq}
+    ):
+        return False
+    condition = parents.get(node)
+    function = parents.get(condition)
+    if not (isinstance(condition, ast.If) and isinstance(function, ast.FunctionDef)
+            and function.body[0] is condition and any(
+                isinstance(decorator, ast.Name) and decorator.id == "property"
+                for decorator in function.decorator_list)):
+        return False
+    a, b = node.left, node.comparators[0]
+    if isinstance(a, ast.Constant):
+        a, b = b, a
+    return (isinstance(a, ast.Attribute) and isinstance(a.value, ast.Name)
+            and isinstance(b, ast.Constant) and b.value is None)
+
+
+def resolve_cached_operand(node, frame):
+    if isinstance(node, ast.Attribute):
+        owner = resolve(node.value, frame)
+        cls = type(owner)
+        if cls.__getattribute__ is object.__getattribute__ and all(
+            node.attr not in vars(base) for base in cls.__mro__
+        ):
+            try:
+                return object.__getattribute__(owner, node.attr)
+            except AttributeError:
+                return MISSING
+    return resolve(node, frame)
+
+
 def equal_operators(a, b, op=ast.Is):
     """Compare both operators only on operand types whose behavior is known."""
     if a is MISSING or b is MISSING:
@@ -306,7 +339,8 @@ class SemanticTrace:
             if path.startswith("tests/"):
                 continue
             for node in simple_comparisons(tree):
-                self.sites.setdefault((path, node.lineno), []).append((node, None))
+                fast = cached_property_comparison(node, parents)
+                self.sites.setdefault((path, node.lineno), []).append((node, fast))
 
     def put(self, kind, key, mask, startup):
         row = self.masks.setdefault(kind, {}).setdefault(key, [0, False])
@@ -333,10 +367,11 @@ class SemanticTrace:
                 uncertain, at_startup = self.masks.get("comparison_uncertain", {}).get(key, (0, False))
                 if (mask and uncertain & mask == mask) or (startup and at_startup):
                     continue
-                if count > 16_384:
+                if count > (2_000_000 if lookup else 16_384):
                     self.put("comparison_uncertain", key, mask, startup)
                     continue
-                a, b = resolve(node.left, frame), resolve(node.comparators[0], frame)
+                operand = resolve_cached_operand if lookup else resolve
+                a, b = operand(node.left, frame), operand(node.comparators[0], frame)
                 self.put("comparison_seen", key, mask, startup)
                 if not equal_operators(a, b, type(node.ops[0])):
                     self.put("comparison_uncertain", key, mask, startup)
