@@ -191,9 +191,57 @@ def site_key(node):
     return f"{node.lineno}:{node.col_offset}"
 
 
-def comparison_edits(original: bytes, patched: bytes):
+def integer_guard(test):
+    """Describe a local-name comparison as either value < limit or value >= limit."""
+    if not isinstance(test, ast.Compare) or len(test.ops) != 1:
+        return None
+    left, right = test.left, test.comparators[0]
+    op = type(test.ops[0])
+    if isinstance(right, ast.Name):
+        left, right = right, left
+        op = {ast.Lt: ast.Gt, ast.LtE: ast.GtE, ast.Gt: ast.Lt, ast.GtE: ast.LtE}.get(op)
+    if not isinstance(left, ast.Name) or op not in ORDER_OPERATORS:
+        return None
+    bound = literal(right)
+    if type(bound) is not int:
+        return None
+    return left.id, op in (ast.Lt, ast.LtE), bound + (op in (ast.LtE, ast.Gt))
+
+
+def integer_guard_sites(tree):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and node.lineno == node.test.lineno == node.test.end_lineno:
+            guard = integer_guard(node.test)
+            if guard is not None:
+                yield node, guard
+
+
+def integer_guard_edit(original, patched):
+    """Accept one integer threshold edit when the rest of the AST is identical."""
+    left, right = list(integer_guard_sites(original)), list(integer_guard_sites(patched))
+    if len(left) != len(right):
+        return None
+    changes = [(old, new, a, b) for (old, a), (new, b) in zip(left, right)
+               if ast.dump(old.test) != ast.dump(new.test)]
+    if len(changes) != 1:
+        return None
+    old, new, a, b = changes[0]
+    if a[:2] != b[:2]:
+        return None
+    replacement = new.test
+    try:
+        new.test = old.test
+        if ast.dump(original) == ast.dump(patched):
+            return site_key(old.test), min(a[2], b[2]), max(a[2], b[2])
+    finally:
+        new.test = replacement
+    return None
+
+
+def comparison_edits(original: bytes | ast.AST, patched: bytes | ast.AST):
     """Identify patches changing only one supported comparison operator."""
-    a, b = (ast.parse(data, type_comments=True) for data in (original, patched))
+    a, b = (data if isinstance(data, ast.AST) else ast.parse(data, type_comments=True)
+            for data in (original, patched))
     left, right = list(simple_comparisons(a)), list(simple_comparisons(b))
     if len(left) != len(right):
         return None
@@ -203,8 +251,12 @@ def comparison_edits(original: bytes, patched: bytes):
     old, new = changes[0]
     if SWAPS[type(old.ops[0])] is not type(new.ops[0]):
         return None
-    new.ops = old.ops
-    return old if ast.dump(a) == ast.dump(b) else None
+    ops = new.ops
+    try:
+        new.ops = old.ops
+        return old if ast.dump(a) == ast.dump(b) else None
+    finally:
+        new.ops = ops
 
 
 def resolve(node, frame):
@@ -287,6 +339,7 @@ class SemanticTrace:
 
     def __init__(self, sites=None):
         self.masks = {}
+        self.integer_ranges = {}
         self.context = None
         self.counts = {}
         self.memory_sensitive = set()
@@ -341,6 +394,8 @@ class SemanticTrace:
             for node in simple_comparisons(tree):
                 fast = cached_property_comparison(node, parents)
                 self.sites.setdefault((path, node.lineno), []).append((node, fast))
+            for node, (name, _, _) in integer_guard_sites(tree):
+                self.sites.setdefault((path, node.lineno), []).append((node.test, (name,)))
 
     def put(self, kind, key, mask, startup):
         row = self.masks.setdefault(kind, {}).setdefault(key, [0, False])
@@ -358,6 +413,9 @@ class SemanticTrace:
         frame = _getframe(2)
         active = False
         for node, lookup in sites:
+            if isinstance(lookup, tuple):
+                active |= self.observe_integer_guard(node, lookup[0], path, frame, mask, startup, count)
+                continue
             if isinstance(lookup, str):
                 self.observe_derived(lookup, frame, mask, startup)
                 active = True
@@ -402,6 +460,38 @@ class SemanticTrace:
             else:
                 self.put("whole_value", key, mask, startup)
         return active
+
+    def observe_integer_guard(self, node, name, path, frame, mask, startup, count):
+        key = site_key(node)
+        full_key = f"{path}:{key}"
+        unknown, _ = self.masks.get("integer_guard_unknown", {}).get(full_key, (0, False))
+        if mask and unknown & mask == mask:
+            return False
+        value = frame.f_locals.get(name) if name in frame.f_code.co_varnames else None
+        if startup or type(value) is not int or count > 16_384:
+            self.put("integer_guard_unknown", full_key, mask, startup)
+            return False
+        if mask:
+            self.record_integer_range(path, key, mask, value, value)
+        return bool(mask)
+
+    def record_integer_range(self, path, key, mask, low, high):
+        groups = self.integer_ranges.setdefault(path, {}).setdefault(key, {})
+        if mask in groups:
+            previous_low, previous_high = groups[mask]
+            low, high = min(low, previous_low), max(high, previous_high)
+        groups[mask] = low, high
+
+    def encoded_integer_ranges(self):
+        return {path: {key: {format(mask, "x"): bounds for mask, bounds in groups.items()}
+                       for key, groups in sites.items()}
+                for path, sites in self.integer_ranges.items()}
+
+    def merge_integer_ranges(self, source):
+        for path, sites in source.items():
+            for key, groups in sites.items():
+                for mask, (low, high) in groups.items():
+                    self.record_integer_range(path, key, int(mask, 16), low, high)
 
     def observe_derived(self, kind, frame, mask, startup):
         locals_ = frame.f_locals

@@ -9,6 +9,7 @@
 !semantic.py
 !verify.py
 !query_replay.py
+!optimizer_replay.py
 !build_isolation.py
 !warm_verify.py
 !build_subprocess_profiles.py

@@ -64,7 +64,7 @@ class QueryTrace:
         self.monitor.free_tool_id(self.tool)
 
 
-def run_executor_cases(dataset, indices=None, trace=None):
+def run_executor_cases(dataset, indices=None, trace=None, before_case=None):
     """Use the suite's setup, exact worker functions and result assertions."""
     from sqlglot import parse_one
     from tests import test_executor as suite
@@ -83,6 +83,8 @@ def run_executor_cases(dataset, indices=None, trace=None):
                 trace.switch(index)
             start = time.process_time()
             options, sql, _ = cases[index]
+            if before_case is not None:
+                before_case(index, options)
             # The pinned test serializes the input/result across a process pool.
             inputs = pickle.loads(pickle.dumps((parse_one(sql), options)))
             result = pickle.loads(pickle.dumps(suite.mp_execute(*inputs)))

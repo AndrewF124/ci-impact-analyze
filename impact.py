@@ -11,7 +11,10 @@ from pathlib import Path
 from types import CodeType
 
 from patch_parser import FilePatch, parse_patch
-from semantic import MISSING, Shape, comparison_edits, derived_field_edits, literal, literal_field_edits, site_key
+from semantic import (
+    MISSING, Shape, comparison_edits, derived_field_edits, integer_guard_edit, literal,
+    literal_field_edits, site_key,
+)
 
 SOURCE_COMMIT = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
@@ -82,9 +85,16 @@ def same_expression_shape(old, new) -> bool:
     if any(isinstance(old, kind) and isinstance(new, kind) for kind in OPERATOR_KINDS):
         return True
     if type(old) is not type(new):
-        return False
+        # An explicitly signed integer and an unsigned integer are both
+        # literals, even though Python parses the sign as a unary operator.
+        return (
+            isinstance(old, (ast.Constant, ast.UnaryOp))
+            and isinstance(new, (ast.Constant, ast.UnaryOp))
+            and type(literal(old)) is int and type(literal(new)) is int
+        )
     if isinstance(old, (ast.Lambda, ast.GeneratorExp)):
-        return False
+        # An unchanged comprehension can appear alongside an edited argument.
+        return ast.dump(old) == ast.dump(new)
     if isinstance(old, ast.Constant):
         return type(old.value) is type(new.value)
     if isinstance(old, ast.AST):
@@ -179,6 +189,8 @@ class ImpactIndex:
         self.shared = raw["shared"]
         self.startup = raw["startup_lines"]
         self.semantic = raw.get("semantic", {})
+        self.integer_guards = raw.get("integer_guards", {})
+        self.integer_guard_unreliable = sum(test_bits.get(node_id, 0) for node_id in set(raw["unreliable"]))
         self.fixture_directories = raw.get("fixture_directories", False)
         self.module_discovery = raw.get("module_discovery", False)
         self.isolated = {}
@@ -240,10 +252,10 @@ class ImpactIndex:
         bits, startup = self.semantic.get(kind, {}).get(key, ("0", False))
         return int(bits, 16), startup
 
-    def equivalent_comparison(self, original: str, patched: bytes, path: str) -> int:
+    def equivalent_comparison(self, before: ast.AST, after: ast.AST, path: str) -> int:
         if not self.semantic.get("comparison_seen"):
             return 0
-        site = comparison_edits(original.encode("utf-8"), patched)
+        site = comparison_edits(before, after)
         if site is None:
             return 0
         key = f"{path}:{site_key(site)}"
@@ -252,6 +264,23 @@ class ImpactIndex:
         incomplete, _ = self.observations("incomplete", "*")
         uncertain |= incomplete
         return 0 if startup else seen & ~uncertain
+
+    def equivalent_integer_guard(self, before, after, path):
+        profiles = self.integer_guards.get(path)
+        if not profiles or (edit := integer_guard_edit(before, after)) is None:
+            return 0
+        key, first, stop = edit
+        unknown, startup = self.observations("integer_guard_unknown", f"{path}:{key}")
+        if startup:
+            return 0
+        incomplete, _ = self.observations("incomplete", "*")
+        seen = 0
+        for bits, (low, high) in profiles.get(key, {}).items():
+            mask = int(bits, 16)
+            seen |= mask
+            if first < stop and low < stop and first <= high:
+                unknown |= mask
+        return seen & ~(unknown | incomplete | self.integer_guard_unreliable)
 
     def python_impact(self, file: FilePatch, path: str, *, compare_operands=True) -> int:
         original, before = self.original(path)
@@ -299,7 +328,9 @@ class ImpactIndex:
                 statement_hits |= span_hits
             function_mask = (statement_hits | isolated_statements) if statement_hits else (hits | isolated_hits)
             if compare_operands and statement_hits and len(callables) == 1:
-                function_mask &= ~self.equivalent_comparison(original, patched, path)
+                function_mask &= ~self.equivalent_comparison(before, after, path)
+                # The range proof was measured in suite order, not in separate cold runs.
+                function_mask &= ~(self.equivalent_integer_guard(before, after, path) & ~isolated_statements)
             mask |= function_mask
         return mask
 
@@ -309,6 +340,8 @@ class ImpactIndex:
             path = file.old_path
             if path != file.new_path or not path or not path.startswith("sqlglot/") or not path.endswith(".py"):
                 raise UnknownImpact("verification requires existing Python source")
+            if path in edits:
+                raise UnknownImpact("verification requires one patch section per file")
             original, _ = self.original(path)
             edits[path] = file.apply(original).encode("utf-8")
         return edits
@@ -442,11 +475,13 @@ class ImpactIndex:
     def query_cases(self, edits, node_id, profile):
         """Map supported body edits to isolated cases, refusing setup changes."""
         bit = self.test_bits.get(node_id, 0)
-        if not bit or not profile:
+        if not bit or not profile or len(edits) != 1:
             return None
         cases = 0
         for path, patched in edits.items():
-            if self.line_masks(path).get(0, 0) & bit:
+            baseline = self.line_masks(path)
+            isolated = self.isolated.get(path, {})
+            if (baseline.get(0, 0) | isolated.get(0, 0)) & bit or 0 in self.startup.get(path, ()):
                 return None
             _, original = self.original(path)
             functions = changed_callables(original, ast.parse(patched, type_comments=True))
@@ -458,10 +493,10 @@ class ImpactIndex:
                 for first, last in spans:
                     for line in range(first, last + 1):
                         covered = int(lines.get(str(line), "0"), 16)
-                        if not covered and self.isolated.get(path, {}).get(line, 0) & bit:
+                        if not covered and (baseline.get(line, 0) | isolated.get(line, 0)) & bit:
                             return None
                         cases |= covered
-        if cases & 1:
+        if not cases or cases & 1 or cases >> (len(profile["times"]) + 1):
             return None
         return [i for i in range(len(profile["times"])) if cases & (2 << i)]
 

@@ -8,8 +8,9 @@ from pathlib import Path
 
 from fallback import FallbackIndex
 from impact import ImpactIndex
+from optimizer_replay import SOURCE as OPTIMIZER_SOURCE, TEST as OPTIMIZER_TEST
 from patch_parser import parse_patch
-from verify import TPC_TESTS, Verification
+from verify import Verification
 
 DATA = Path("/data")
 PINNED = Path("/pinned")
@@ -18,6 +19,8 @@ ISOLATION = Path(__file__).with_name("isolated.json.gz")
 SUBPROCESS_PROFILE = Path(__file__).with_name("subprocess.json")
 VERIFICATION = Path(__file__).with_name("verification.json")
 QUERY_PROFILES = Path(__file__).with_name("query-profiles.json.gz")
+CHECKPOINTS = Path(__file__).with_name("optimizer-checkpoints.json.gz")
+STRUCTURAL_REFERENCES = Path(__file__).with_name("structural-references.json")
 MAX_WORKERS = 8
 WORKER_COST_MS = 2_000
 COLLECTION_PROBE_COST_MS = 3_000
@@ -79,8 +82,7 @@ def verify_selected(impact, files, selected, verification, durations, node_ids):
         return frozenset()
     # Exact cold runs can also establish an outcome for an untraced test.
     cheap = sorted(n for n in selected if durations[n] <= 500)
-    query_tests = [n for n in selected - impact.always
-                   if node_ids[n] in TPC_TESTS or node_ids[n] in verification.queries]
+    query_tests = [n for n in selected - impact.always if node_ids[n] in verification.queries]
     probe = len(cheap) <= 12 and 0 < sum(durations[n] for n in cheap) <= 900
     if not probe and not query_tests:
         return frozenset()
@@ -96,9 +98,6 @@ def verify_selected(impact, files, selected, verification, durations, node_ids):
             continue
         cases = impact.query_cases(edits, node, verification.queries.get(node))
         if cases is not None and verification.queries_pass(edits, node, cases, savings):
-            passed.add(n)
-        elif (node in TPC_TESTS and savings >= 2_000
-              and impact.tpc_replay_scope(edits, node) and verification.tpc_passes(edits, node)):
             passed.add(n)
     if probe:
         jobs = sorted(((n, durations[n]) for n in selected - passed), key=itemgetter(1), reverse=True)
@@ -123,7 +122,7 @@ def schedule_cost(workers, durations):
     return max((sum(durations[n] for n in group) for group in workers), default=0) + WORKER_COST_MS * len(workers)
 
 
-def main(*, replay=False) -> None:
+def main(*, replay=False, checkpoints=True) -> None:
     tests = json.loads((DATA / "tests.json").read_text(encoding="utf-8"))["tests"]
     try:
         impact = ImpactIndex(PINNED, COVERAGE, tests, ISOLATION, SUBPROCESS_PROFILE)
@@ -132,7 +131,10 @@ def main(*, replay=False) -> None:
         impact = None
     try:
         query_path = QUERY_PROFILES if replay else None
-        verification = Verification(PINNED, json.loads(VERIFICATION.read_bytes()), query_path)
+        verification = Verification(
+            PINNED, json.loads(VERIFICATION.read_bytes()), query_path,
+            CHECKPOINTS if checkpoints else None,
+        )
     except (OSError, ValueError):
         verification = None
 
@@ -143,6 +145,7 @@ def main(*, replay=False) -> None:
     )
     durations = dict(timed_tests)
     node_ids = {test["number"]: test["id"] for test in tests}
+    optimizer_test = next((n for n, node in node_ids.items() if node == OPTIMIZER_TEST), None)
     schedules = {None: schedule(timed_tests)}
     full_cost = schedule_cost(schedules[None], durations)
     plans = []
@@ -173,7 +176,7 @@ def main(*, replay=False) -> None:
             continue
         try:
             if fallback_index is None:
-                fallback_index = FallbackIndex(impact, tests)
+                fallback_index = FallbackIndex(impact, tests, STRUCTURAL_REFERENCES)
             scope = fallback_index.select(files)
             if scope is None:
                 continue
@@ -192,12 +195,39 @@ def main(*, replay=False) -> None:
         except (OSError, ValueError, SyntaxError, RecursionError, ImportError):
             pass
 
+    verified_checkpoints = set()
+    if checkpoints and verification is not None and optimizer_test is not None:
+        checks = []
+        for commit_id, files, selected, scoped in plans:
+            if (not selected or scoped or optimizer_test not in selected - impact.always
+                    or len(files) != 1 or files[0].old_path != OPTIMIZER_SOURCE
+                    or files[0].new_path != OPTIMIZER_SOURCE):
+                continue
+            before_cost = schedule_cost(workers_for(selected), durations)
+            after_cost = schedule_cost(workers_for(selected - {optimizer_test}), durations)
+            if before_cost - after_cost >= 3_000:
+                checks.append((before_cost - after_cost, commit_id, files))
+
+        # Verification has a shared CPU budget. Spend it where a pass can save the most.
+        for savings, commit_id, files in sorted(checks, key=itemgetter(0), reverse=True):
+            try:
+                edits = impact.patched_files(files)
+                if impact.tpc_replay_scope(edits, OPTIMIZER_TEST):
+                    before, _ = impact.original(OPTIMIZER_SOURCE)
+                    if verification.optimizer_passes(before.encode("utf-8"), edits, savings):
+                        verified_checkpoints.add(commit_id)
+            except (OSError, ValueError, SyntaxError, RecursionError, KeyError, TypeError):
+                pass
+
     fallback = selected_count = 0
     for commit_id, files, selected, scoped in plans:
         verified = frozenset()
+        if commit_id in verified_checkpoints:
+            verified = frozenset({optimizer_test})
+            selected -= verified
         if replay and verification is not None and selected and not scoped:
             try:
-                verified = verify_selected(impact, files, selected, verification, durations, node_ids)
+                verified |= verify_selected(impact, files, selected, verification, durations, node_ids)
                 selected -= verified
             except (OSError, ValueError, SyntaxError, RecursionError):
                 pass
@@ -217,4 +247,6 @@ if __name__ == "__main__":
 
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--replay", action="store_true", help="run optional test and query probes")
-    main(replay=parser.parse_args().replay)
+    parser.add_argument("--no-checkpoints", action="store_true", help="skip targeted optimizer checkpoint verification")
+    args = parser.parse_args()
+    main(replay=args.replay, checkpoints=not args.no_checkpoints)

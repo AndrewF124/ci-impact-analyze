@@ -206,11 +206,15 @@ class Coverage:
                 for path, hits in table.items()
             }
 
-        return {"lines": encode(self.lines), "shared": encode(self.shared), "semantic": self.semantic.encoded()}
+        return {
+            "lines": encode(self.lines), "shared": encode(self.shared), "semantic": self.semantic.encoded(),
+            "integer_guards": self.semantic.encoded_integer_ranges(),
+        }
 
     def merge(self, result: dict) -> None:
         self.incomplete |= int(result["incomplete"], 16)
         self.semantic.merge(result["semantic"])
+        self.semantic.merge_integer_ranges(result.get("integer_guards", {}))
         for table, encoded in ((self.lines, result["lines"]), (self.shared, result["shared"])):
             for path, incoming in encoded.items():
                 hits = table.setdefault(path, {})

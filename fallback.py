@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import ast
+import json
 import re
 from collections import defaultdict
 from copy import copy
 from functools import cache
 from importlib.util import resolve_name
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from semantic import MISSING, literal, module_name
 
@@ -16,6 +17,8 @@ DIALECTS = "sqlglot/dialects/"
 REGISTRY_NAMES = {"classes", "_classes", "DIALECTS", "Dialects", "DIALECT_MODULE_NAMES"}
 DEFINITIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 DEFAULT_ATTRIBUTES = {"__defaults__", "__kwdefaults__", "__signature__", "__wrapped__"}
+REFERENCE_VERSION = 1
+REGISTRY_KEY = "*"
 
 
 def pure_literal(node):
@@ -100,44 +103,122 @@ def import_targets(tree, package):
                 yield node.args[0].value
 
 
+def python_sources(pinned):
+    return tuple(file.relative_to(pinned).as_posix()
+                 for directory in ("sqlglot", "tests")
+                 for file in (pinned / directory).rglob("*.py"))
+
+
+def dialect_paths(tree):
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "DIALECTS"):
+            names = literal(node.value)
+            if isinstance(names, list) and all(isinstance(name, str) for name in names):
+                return {DIALECTS + name.lower() + ".py" for name in names}
+    return set()
+
+
+def importers(trees):
+    files = {module_name(path): path for path in trees}
+    edges = defaultdict(set)
+    for name, path in files.items():
+        package = name if path.endswith("/__init__.py") else name.rpartition(".")[0]
+        for target in set(import_targets(trees[path], package)) & files.keys():
+            if target != name:
+                edges[files[target]].add(path)
+    return edges
+
+
+def scoped_nodes(node, owner=None):
+    if isinstance(node, DEFINITIONS):
+        prefix = owner[0] if owner else ""
+        owner = (prefix + "::" + node.name, node.lineno, node.end_lineno)
+    yield node, owner
+    for child in ast.iter_child_nodes(node):
+        yield from scoped_nodes(child, owner)
+
+
+def reference_value(node):
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else None
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.alias):
+        return node.name
+    return None
+
+
+def build_references(pinned, output):
+    trees = {path: ast.parse((pinned / path).read_bytes(), filename=path, type_comments=True)
+             for path in python_sources(pinned)}
+    stems = sorted(PurePosixPath(path).stem for path in dialect_paths(trees[DIALECTS + "__init__.py"]))
+    patterns = {stem: re.compile(r"\b" + re.escape(stem) + r"\b", re.I) for stem in stems}
+    boundary = re.compile(r"\b")
+
+    @cache
+    def references(value):
+        keys = [stem for stem, pattern in patterns.items() if pattern.search(value)]
+        if value in REGISTRY_NAMES:
+            keys.append(REGISTRY_KEY)
+        if boundary.search(value):
+            keys.append("")
+        return keys
+
+    sites = {name: defaultdict(set) for name in (*stems, REGISTRY_KEY, "")}
+    for path, tree in trees.items():
+        if not path.startswith("tests/"):
+            continue
+        for node, owner in scoped_nodes(tree):
+            value = reference_value(node)
+            if value is not None:
+                for name in references(value):
+                    sites[name][path].add(owner or ("", 0, 0))
+
+    output.write_text(json.dumps({
+        "version": REFERENCE_VERSION,
+        "importers": {path: sorted(paths) for path, paths in importers(trees).items()},
+        "sites": {name: {path: sorted(owners) for path, owners in files.items()} for name, files in sites.items()},
+    }, separators=(",", ":")), encoding="utf-8")
+
+
 class FallbackIndex:
-    def __init__(self, impact, catalog):
+    def __init__(self, impact, catalog, reference_path=None):
         self.impact = impact
         self.pinned = impact.pinned
+        self.reference_path = reference_path
         self.by_file = defaultdict(list)
         for test in catalog:
             self.by_file[test["file"]].append((test["id"], test["number"]))
 
     @cache
     def source_files(self):
-        return tuple(
-            file.relative_to(self.pinned).as_posix()
-            for directory in ("sqlglot", "tests")
-            for file in (self.pinned / directory).rglob("*.py")
-        )
+        return python_sources(self.pinned)
+
+    @cache
+    def references(self):
+        if self.reference_path is not None:
+            try:
+                data = json.loads(self.reference_path.read_bytes())
+                if data.get("version") == REFERENCE_VERSION and data["importers"] and data["sites"]:
+                    return data
+            except (OSError, ValueError, KeyError, AttributeError):
+                pass
+        return None
 
     @cache
     def dialect_paths(self):
         _, tree = self.impact.original(DIALECTS + "__init__.py")
-        for node in tree.body:
-            if (isinstance(node, ast.Assign) and len(node.targets) == 1
-                    and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "DIALECTS"):
-                names = literal(node.value)
-                if isinstance(names, list) and all(isinstance(name, str) for name in names):
-                    return {DIALECTS + name.lower() + ".py" for name in names}
-        return set()
+        return dialect_paths(tree)
 
     @cache
     def importers(self):
-        files = {module_name(path): path for path in self.source_files()}
-        edges = defaultdict(set)
-        for name, path in files.items():
-            _, tree = self.impact.original(path)
-            package = name if path.endswith("/__init__.py") else name.rpartition(".")[0]
-            for target in set(import_targets(tree, package)) & files.keys():
-                if target != name:
-                    edges[files[target]].add(path)
-        return edges
+        references = self.references()
+        if references is not None:
+            return {path: set(paths) for path, paths in references["importers"].items()}
+        return importers({path: self.impact.original(path)[1] for path in self.source_files()})
 
     def reverse_dependencies(self, path):
         edges = self.importers()
@@ -164,51 +245,40 @@ class FallbackIndex:
             mask |= lines.get(number, 0) | isolated.get(number, 0)
         return mask
 
-    def test_scope(self, path, matches):
-        _, tree = self.impact.original(path)
+    def test_scope(self, path, owners):
         entries = self.by_file[path]
         extra = set()
         mask = 0
-
-        def visit(node, prefix, owner):
-            nonlocal mask
-            if isinstance(node, DEFINITIONS):
-                prefix += "::" + node.name
-                owner = node
-            if matches(node):
-                if owner is None:
-                    extra.update(number for _, number in entries)
-                else:
-                    qualified = path + prefix
-                    members = {number for name, number in entries
-                               if name == qualified or name.startswith((qualified + "::", qualified + "["))}
-                    extra.update(members)
-                    if not members:
-                        mask |= self.span_mask(path, owner.lineno, owner.end_lineno)
-            for child in ast.iter_child_nodes(node):
-                visit(child, prefix, owner)
-
-        visit(tree, "", None)
+        if any(not owner or not owner[0] for owner in owners):
+            extra.update(number for _, number in entries)
+        for prefix, first, last in (owner for owner in owners if owner and owner[0]):
+            qualified = path + prefix
+            members = {number for name, number in entries
+                       if name == qualified or name.startswith((qualified + "::", qualified + "["))}
+            extra.update(members)
+            if not members:
+                mask |= self.span_mask(path, first, last)
         return extra | self.impact.test_numbers(mask)
 
     @cache
     def dialect_consumers(self, stems):
+        references = self.references()
+        keys = (stems or {""}) | {REGISTRY_KEY}
+        if references is not None and keys <= references["sites"].keys():
+            owners = defaultdict(set)
+            for key in keys:
+                for path, sites in references["sites"][key].items():
+                    if path in self.by_file:
+                        owners[path].update(map(tuple, sites))
+            return frozenset().union(*(self.test_scope(path, sites) for path, sites in owners.items()))
+
         pattern = re.compile(r"\b(?:" + "|".join(map(re.escape, sorted(stems))) + r")\b", re.I)
 
-        def matches(node):
-            if isinstance(node, ast.Constant):
-                value = node.value
-            elif isinstance(node, ast.Name):
-                value = node.id
-            elif isinstance(node, ast.Attribute):
-                value = node.attr
-            elif isinstance(node, ast.alias):
-                value = node.name
-            else:
-                return False
-            return isinstance(value, str) and (value in REGISTRY_NAMES or pattern.search(value) is not None)
-
-        return frozenset().union(*(self.test_scope(path, matches) for path in self.by_file if path.endswith(".py")))
+        return frozenset().union(*(
+            self.test_scope(path, {owner for node, owner in scoped_nodes(self.impact.original(path)[1])
+                                   if (value := reference_value(node)) is not None
+                                   and (value in REGISTRY_NAMES or pattern.search(value) is not None)})
+            for path in self.by_file if path.endswith(".py")))
 
     def broken_import_scope(self, path):
         affected = self.reverse_dependencies(path)
@@ -283,7 +353,8 @@ class FallbackIndex:
                         return None
                     mask |= self.span_mask(source, ancestor.lineno, ancestor.end_lineno)
                 if source in self.by_file:
-                    selected.update(self.test_scope(source, readers.__contains__))
+                    owners = {owner for node, owner in scoped_nodes(tree) if node in readers}
+                    selected.update(self.test_scope(source, owners))
         return selected | self.impact.test_numbers(mask) | self.impact.always
 
     def added_module(self, file, path):
@@ -334,3 +405,9 @@ class FallbackIndex:
                 and 0 not in self.impact.startup.get(path, ())):
             return self.broken_import_scope(path), {path: patched}
         return None
+
+
+if __name__ == "__main__":
+    import sys
+
+    build_references(Path.cwd(), Path(sys.argv[1]))

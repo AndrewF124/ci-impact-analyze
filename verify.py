@@ -13,8 +13,9 @@ import tempfile
 import time
 from pathlib import Path
 
+from optimizer_replay import SOURCE as OPTIMIZER_SOURCE, cases_for, changed_site, replay as replay_optimizer
 from query_replay import load_profiles, run_cases
-from semantic import TPC_TESTS, module_name, show_closure
+from semantic import module_name, show_closure
 from warm_verify import WarmProcess
 
 
@@ -98,26 +99,6 @@ def snapshot(modules, unordered_by_module=None):
     return fields
 
 
-def tpc_signatures(dataset):
-    from sqlglot import parse_one, transpile
-    from sqlglot.optimizer import optimize
-    from sqlglot.schema import ensure_schema
-    from sqlglot.serde import dump
-    from tests.helpers import TPCDS_SCHEMA, TPCH_SCHEMA, load_sql_fixture_pairs
-
-    schema = TPCH_SCHEMA if dataset == "tpc-h" else TPCDS_SCHEMA
-    signatures = []
-    for options, sql, _ in load_sql_fixture_pairs(f"optimizer/{dataset}/{dataset}.sql"):
-        parsed = parse_one(sql)
-        if options.get("execute"):
-            optimized = optimize(parsed, ensure_schema(schema), leave_tables_isolated=True)
-            signatures.append(digest((sql, dump(optimized), transpile(sql, write="duckdb"))))
-        else:
-            # The real test parses the query before a worker checks its execute flag.
-            signatures.append(digest((sql, dump(parsed))))
-    return signatures
-
-
 def overlay(source, target, edits):
     """Point unmodified paths at the read-only pinned checkout."""
     for name in ("sqlglot", "tests", "pyproject.toml"):
@@ -190,7 +171,7 @@ def pytest_collection():
 
 
 class Verification:
-    def __init__(self, pinned, baseline, query_path=None):
+    def __init__(self, pinned, baseline, query_path=None, checkpoint_path=None):
         self.pinned = pinned
         self.baseline = baseline
         self.started = time.monotonic()
@@ -198,6 +179,8 @@ class Verification:
         self.pristine = None
         self.queries = load_profiles(query_path) if query_path is not None else {}
         self.warm = WarmProcess(pinned) if query_path is not None else None
+        self.checkpoint_path = checkpoint_path
+        self.checkpoints = None
 
     def run(self, edits, operation, timeout):
         if not hasattr(os, "fork"):
@@ -301,20 +284,38 @@ class Verification:
         if self.warm:
             self.warm.close()
 
-    def tpc_passes(self, edits, node_id):
-        expected = self.baseline["tpc"].get(node_id)
-        if expected:
-            return self.run(edits, lambda: tpc_signatures(TPC_TESTS[node_id]) == expected, 4.5) is True
-        return False
+    def optimizer_passes(self, before, edits, savings):
+        if self.checkpoint_path is None:
+            return False
+        target = edits[OPTIMIZER_SOURCE]
+        site = changed_site(before, target)
+        if site is None:
+            return False
+        if self.checkpoints is None:
+            self.checkpoints = load_profiles(self.checkpoint_path)
+        profile = self.checkpoints
+        if profile.get("source") != hashlib.sha256(before).hexdigest():
+            return False
+        cases = cases_for(profile, site)
+        if cases is None:
+            return False
+        if not cases:
+            return True
+        budget = min(12_000, 2 * savings // 3)
+        estimate = 1_200 + sum(max(2, profile["cases"][str(index)][3]) for index in cases) * 2
+        if estimate > budget:
+            return False
+        timeout = min(18.0, 2.0 + 1.4 * budget / 1000)
+        return self.run(edits, lambda: replay_optimizer(profile, cases, budget), timeout) is True
 
     def queries_pass(self, edits, node_id, indices, available_ms):
+        if not indices:
+            return False
         profile = self.queries[node_id]
         # The build records instrumented CPU, an upper estimate for plain replay.
         estimate = 900 + sum(profile["times"][index] for index in indices)
         if estimate * 1.5 > available_ms or estimate > 6_000:
             return False
-        if not indices:
-            return True
         timeout = min(8.0, max(2.5, 1.5 * estimate / 1000))
         return self.run(edits, lambda: bool(run_cases(node_id, profile, indices)), timeout) is True
 
@@ -324,6 +325,5 @@ if __name__ == "__main__":
                       if path.name != "__main__.py"})
     unordered = {}
     state = snapshot(modules, unordered)
-    tpc = {name: tpc_signatures(dataset) for name, dataset in TPC_TESTS.items()}
-    data = {"modules": modules, "state": state, "tpc": tpc, "unordered_tuple_bindings": unordered}
+    data = {"modules": modules, "state": state, "unordered_tuple_bindings": unordered}
     Path(sys.argv[1]).write_text(json.dumps(data), encoding="utf-8")
