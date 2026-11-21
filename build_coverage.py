@@ -201,7 +201,7 @@ class Coverage:
                                 return
                             frame = frame.f_back
                     self.record(path, 0)
-                    key = fixture_open_key(path, self.source_path(caller.co_filename), caller.co_name)
+                    key = fixture_open_key(path, self.source_path(caller.f_code.co_filename), caller.f_code.co_name)
                     if key is not None:
                         self.record(key, 0)
 
