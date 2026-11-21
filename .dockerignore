@@ -1,0 +1,7 @@
+*
+!Dockerfile
+!requirements.lock
+!selector.py
+!patch_parser.py
+!impact.py
+!build_coverage.py
